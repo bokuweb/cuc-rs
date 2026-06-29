@@ -27,7 +27,7 @@ impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
             sort_usings: true,
-            reorder_modifiers: true,
+            reorder_modifiers: false,
             normalize_spacing: false,
             normalize_newlines: true,
             sort_system_directives_first: properties
@@ -155,7 +155,13 @@ fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
     while index < lines.len() {
         if is_using_directive(lines[index]) {
             let start = index;
-            while index < lines.len() && is_using_directive(lines[index]) {
+            while index < lines.len()
+                && (is_using_directive(lines[index])
+                    || (lines[index].trim().is_empty()
+                        && index > start
+                        && is_using_alias_directive(lines[index - 1])
+                        && next_nonblank_is_using_alias_directive(&lines, index + 1)))
+            {
                 index += 1;
             }
             output.extend(format_using_block(&lines[start..index], options));
@@ -168,7 +174,22 @@ fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
     output.join("\n")
 }
 
+fn next_nonblank_is_using_alias_directive(lines: &[&str], mut index: usize) -> bool {
+    while index < lines.len() {
+        if !lines[index].trim().is_empty() {
+            return is_using_alias_directive(lines[index]);
+        }
+        index += 1;
+    }
+
+    false
+}
+
 fn is_using_directive(line: &str) -> bool {
+    if line.trim_start() != line {
+        return false;
+    }
+
     let trimmed = line.trim_start();
     let Some(rest) = trimmed
         .strip_prefix("using ")
@@ -180,12 +201,21 @@ fn is_using_directive(line: &str) -> bool {
     rest.ends_with(';') && !rest.contains('{') && !rest.contains('}')
 }
 
+fn is_using_alias_directive(line: &str) -> bool {
+    is_using_directive(line) && using_sort_key(line).contains('=')
+}
+
 fn format_using_block(lines: &[&str], options: &CSharpOptions) -> Vec<String> {
     let indent = lines
-        .first()
+        .iter()
+        .find(|line| is_using_directive(line))
         .and_then(|line| line.get(..line.len() - line.trim_start().len()))
         .unwrap_or("");
-    let directives: BTreeSet<String> = lines.iter().map(|line| line.trim().to_string()).collect();
+    let directives: BTreeSet<String> = lines
+        .iter()
+        .filter(|line| is_using_directive(line))
+        .map(|line| line.trim().to_string())
+        .collect();
     let mut directives: Vec<String> = directives.into_iter().collect();
 
     directives.sort_by(|left, right| compare_using_directives(left, right, options));
@@ -237,10 +267,7 @@ fn compare_using_directives(
 fn is_system_using(line: &str) -> bool {
     let target = using_sort_key(line);
 
-    target == "System"
-        || target.starts_with("System.")
-        || target.starts_with("static System.")
-        || target.contains("= System.")
+    target == "System" || target.starts_with("System.") || target.starts_with("static System.")
 }
 
 fn using_sort_key(line: &str) -> &str {
@@ -890,6 +917,27 @@ mod tests {
             format_csharp(input, options()),
             "using System;\nusing System.Text;\n\nusing Elsa;\n\nclass C {}\n"
         );
+    }
+
+    #[test]
+    fn normalizes_blank_lines_inside_using_blocks() {
+        let input = "using System;\nusing R3;\n\nusing Task = System.Threading.Tasks.Task;\n\nusing Range = Microsoft.Office.Interop.Word.Range;\n\nnamespace N {}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "using System;\n\nusing R3;\n\nusing Range = Microsoft.Office.Interop.Word.Range;\nusing Task = System.Threading.Tasks.Task;\n\nnamespace N {}\n"
+        );
+    }
+
+    #[test]
+    fn does_not_sort_local_using_statements() {
+        let mut options = options();
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+
+        let input = "using System.Net.Http;\nusing System.Text;\n\nclass C\n{\n    async System.Threading.Tasks.Task M(System.Uri endpoint, HttpClient client, string json, System.Threading.CancellationToken cancellationToken)\n    {\n        using StringContent content = new StringContent(json, Encoding.UTF8, \"application/json\");\n        using HttpResponseMessage response = await client.PostAsync(endpoint, content, cancellationToken);\n    }\n}\n";
+
+        assert_eq!(format_csharp(input, options), input);
     }
 
     #[test]

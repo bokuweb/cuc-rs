@@ -20,11 +20,11 @@ Experimental C# formatter passes are available behind `--csharp`.
 Newline-only C# checks are available behind `--csharp-newlines`.
 
 - `using` directive sorting and duplicate removal
-- modifier ordering via `csharp_preferred_modifier_order`
 - new lines before `else`, `catch`, and `finally`
 
-Broad token spacing rewrites are not enabled in `--csharp` yet. They need a
-syntax-aware implementation before they are safe enough to apply to real C#.
+Broad modifier ordering and token spacing rewrites are not enabled in
+`--csharp` yet. They need a syntax-aware implementation before they are safe
+enough to apply to real C#.
 
 Unused `using` removal is intentionally not implemented yet because it needs a
 semantic model.
