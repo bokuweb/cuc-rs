@@ -18,57 +18,24 @@ pub struct FormatOptions {
     pub insert_final_newline: Option<bool>,
     pub end_of_line: Option<EndOfLine>,
     pub charset_utf8_bom: Option<bool>,
-    pub indent: Option<IndentOptions>,
+    pub indent: Option<()>,
     pub csharp: Option<CSharpOptions>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct IndentOptions {
-    pub style: IndentStyle,
-    pub size: usize,
-    pub tab_width: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum IndentStyle {
-    Space,
-    Tab,
 }
 
 impl FormatOptions {
     pub fn from_properties(
         properties: &Properties,
-        include_text: bool,
-        include_indent: bool,
+        _include_text: bool,
+        _include_indent: bool,
         include_csharp: bool,
         include_csharp_newlines: bool,
         path: &Path,
     ) -> Self {
-        let trim_trailing_whitespace = include_text
-            .then(|| parse_bool(properties.get("trim_trailing_whitespace")))
-            .flatten();
-        let insert_final_newline = include_text
-            .then(|| parse_bool(properties.get("insert_final_newline")))
-            .flatten();
-        let end_of_line = include_text
-            .then(|| match properties.get("end_of_line") {
-                Some("lf") => Some(EndOfLine::Lf),
-                Some("crlf") => Some(EndOfLine::CrLf),
-                _ => None,
-            })
-            .flatten();
-        let charset_utf8_bom = include_text
-            .then(|| match properties.get("charset") {
-                Some("utf-8-bom") => Some(true),
-                Some("utf-8") => Some(false),
-                _ => None,
-            })
-            .flatten();
-        let indent = if include_indent {
-            parse_indent(properties)
-        } else {
-            None
-        };
+        let trim_trailing_whitespace = None;
+        let insert_final_newline = None;
+        let end_of_line = None;
+        let charset_utf8_bom = None;
+        let indent = None;
         let csharp = (include_csharp || include_csharp_newlines)
             .then_some(())
             .and_then(|()| {
@@ -118,7 +85,7 @@ pub fn format_text(input: &str, options: FormatOptions) -> String {
     };
 
     let mut output = String::with_capacity(input.len());
-    if options.charset_utf8_bom.unwrap_or(had_bom) {
+    if had_bom && options.charset_utf8_bom.unwrap_or(true) {
         output.push_str(BOM_MARK);
     }
 
@@ -141,9 +108,6 @@ pub fn format_text(input: &str, options: FormatOptions) -> String {
         if options.trim_trailing_whitespace == Some(true) {
             formatted_line = formatted_line.trim_end_matches([' ', '\t']).to_string();
         }
-        if let Some(indent) = options.indent {
-            formatted_line = normalize_indent(&formatted_line, indent);
-        }
         output.push_str(&formatted_line);
     }
 
@@ -155,42 +119,6 @@ pub fn format_text(input: &str, options: FormatOptions) -> String {
     output
 }
 
-fn parse_indent(properties: &Properties) -> Option<IndentOptions> {
-    let style = match properties.get("indent_style") {
-        Some("space") => IndentStyle::Space,
-        Some("tab") => IndentStyle::Tab,
-        _ => return None,
-    };
-    let tab_width = properties
-        .get("tab_width")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4);
-    let size = properties
-        .get("indent_size")
-        .and_then(|value| {
-            if value == "tab" {
-                Some(tab_width)
-            } else {
-                value.parse().ok()
-            }
-        })
-        .unwrap_or(tab_width);
-
-    Some(IndentOptions {
-        style,
-        size,
-        tab_width,
-    })
-}
-
-fn parse_bool(value: Option<&str>) -> Option<bool> {
-    match value {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    }
-}
-
 fn detect_eol(text: &str) -> EndOfLine {
     if text.as_bytes().windows(2).any(|window| window == b"\r\n") {
         EndOfLine::CrLf
@@ -199,55 +127,29 @@ fn detect_eol(text: &str) -> EndOfLine {
     }
 }
 
-fn normalize_indent(line: &str, options: IndentOptions) -> String {
-    let split = line
-        .find(|ch| ch != ' ' && ch != '\t')
-        .unwrap_or(line.len());
-    let (prefix, rest) = line.split_at(split);
-    if prefix.is_empty() {
-        return line.to_string();
-    }
-
-    let columns = prefix.chars().fold(0usize, |columns, ch| match ch {
-        '\t' => columns + options.tab_width,
-        ' ' => columns + 1,
-        _ => columns,
-    });
-    let normalized_prefix = match options.style {
-        IndentStyle::Space => " ".repeat(columns),
-        IndentStyle::Tab => {
-            let tabs = columns / options.size;
-            let spaces = columns % options.size;
-            format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces))
-        }
-    };
-
-    format!("{normalized_prefix}{rest}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn trims_trailing_whitespace_and_inserts_final_newline() {
+    fn preserves_trailing_whitespace_and_final_newline() {
         let output = format_text(
             "a  \r\nb\t",
             FormatOptions {
-                trim_trailing_whitespace: Some(true),
-                insert_final_newline: Some(true),
-                end_of_line: Some(EndOfLine::Lf),
+                trim_trailing_whitespace: None,
+                insert_final_newline: None,
+                end_of_line: None,
                 charset_utf8_bom: None,
                 indent: None,
                 csharp: None,
             },
         );
 
-        assert_eq!(output, "a\nb\n");
+        assert_eq!(output, "a  \r\nb\t");
     }
 
     #[test]
-    fn can_add_utf8_bom() {
+    fn preserves_missing_utf8_bom() {
         let output = format_text(
             "class C {}\n",
             FormatOptions {
@@ -260,6 +162,6 @@ mod tests {
             },
         );
 
-        assert!(output.as_bytes().starts_with(UTF8_BOM));
+        assert!(!output.as_bytes().starts_with(UTF8_BOM));
     }
 }

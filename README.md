@@ -8,13 +8,10 @@
 > replacement for CI-enforced ReSharper `cleanupcode`.
 
 It is not a ReSharper `cleanupcode` replacement yet. The current target is a
-fast formatter core. Basic text cleanup is available behind `--text`:
-
-- `trim_trailing_whitespace`
-- `insert_final_newline`
-- `end_of_line`
-- `charset = utf-8` / `utf-8-bom`
-- optional leading indentation conversion via `--indent`
+fast formatter core. `--text` and `--indent` are accepted for rule parsing and
+compatibility testing, but they currently preserve existing text bytes instead
+of rewriting trailing whitespace, final newlines, EOLs, BOMs, or leading
+indentation.
 
 Experimental C# formatter passes are available behind `--csharp`.
 Newline-only C# checks are available behind `--csharp-newlines`.
@@ -34,12 +31,7 @@ semantic model.
 ## Usage
 
 ```sh
-cargo run -- --config ../elsa/.editorconfig --text ../elsa/Elsa --check --list
-cargo run -- --config ../elsa/.editorconfig --text ../elsa/Elsa --list
 cargo run -- --config ../elsa/.editorconfig --csharp-newlines ../elsa/Elsa --check --list
 cargo run -- --config ../elsa/.editorconfig --text --csharp ../elsa/Elsa --check --list
+cargo run -- --config ../elsa/.editorconfig --text --indent --csharp ../elsa/Elsa --check --list
 ```
-
-Use `--indent` only when you want to test indentation conversion. It is opt-in
-because changing leading whitespace can disturb manually aligned continuation
-lines.
