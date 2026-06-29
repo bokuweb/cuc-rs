@@ -20,10 +20,13 @@ Experimental C# formatter passes are available behind `--csharp`.
 Newline-only C# checks are available behind `--csharp-newlines`.
 
 - new lines before `else`, `catch`, and `finally`
+- file-header `using` sorting and duplicate removal, excluding generated files,
+  local `using` statements, and string/comment contents
+- conservative control-keyword spacing such as `if (` / `for (` / `when (`
 
-Using sorting, modifier ordering, and token spacing rewrites are implemented as
-internal experiments but are not enabled in `--csharp` yet. They need a
-syntax-aware implementation before they are safe enough to apply to real C#.
+Modifier ordering and broad token spacing rewrites are implemented as internal
+experiments but are not enabled in `--csharp` yet. They need a syntax-aware
+implementation before they are safe enough to apply to real C#.
 
 Unused `using` removal is intentionally not implemented yet because it needs a
 semantic model.

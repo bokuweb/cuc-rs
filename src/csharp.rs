@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use crate::editorconfig::Properties;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CSharpOptions {
     pub sort_usings: bool,
     pub reorder_modifiers: bool,
@@ -26,9 +27,9 @@ pub struct CSharpOptions {
 impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
-            sort_usings: false,
+            sort_usings: true,
             reorder_modifiers: false,
-            normalize_spacing: false,
+            normalize_spacing: true,
             normalize_newlines: true,
             sort_system_directives_first: properties
                 .get("dotnet_sort_system_directives_first")
@@ -232,20 +233,34 @@ fn format_using_block(lines: &[&str], options: &CSharpOptions) -> Vec<String> {
         .find(|line| is_using_directive(line))
         .and_then(|line| line.get(..line.len() - line.trim_start().len()))
         .unwrap_or("");
-    let directives: BTreeSet<String> = lines
+    let mut directives = Vec::new();
+    let mut seen = BTreeSet::new();
+    for directive in lines
         .iter()
         .filter(|line| is_using_directive(line))
         .map(|line| line.trim().to_string())
-        .collect();
-    let mut directives: Vec<String> = directives.into_iter().collect();
+    {
+        if seen.insert(directive.clone()) {
+            directives.push(directive);
+        }
+    }
 
-    directives.sort_by(|left, right| compare_using_directives(left, right, options));
+    if directives
+        .iter()
+        .all(|directive| !is_using_alias_directive(directive))
+    {
+        directives.sort_by(|left, right| compare_using_directives(left, right, options));
+    }
 
     if options.sort_system_directives_first && options.separate_import_directive_groups {
-        let first_non_system = directives.iter().position(|line| !is_system_using(line));
-        if let Some(split) =
-            first_non_system.filter(|split| *split > 0 && *split < directives.len())
-        {
+        let first_non_system = directives
+            .iter()
+            .position(|line| !is_system_using(line) && !is_using_alias_directive(line));
+        if let Some(split) = first_non_system.filter(|split| {
+            *split > 0
+                && *split < directives.len()
+                && lines.iter().any(|line| line.trim().is_empty())
+        }) {
             return directives
                 .into_iter()
                 .enumerate()
@@ -282,7 +297,9 @@ fn compare_using_directives(
         }
     }
 
-    using_sort_key(left).cmp(using_sort_key(right))
+    using_sort_key(left)
+        .to_ascii_lowercase()
+        .cmp(&using_sort_key(right).to_ascii_lowercase())
 }
 
 fn is_system_using(line: &str) -> bool {
@@ -366,7 +383,7 @@ enum CodeState {
     Char,
 }
 
-fn normalize_token_spacing(input: &str, options: &CSharpOptions) -> String {
+fn normalize_token_spacing(input: &str, _options: &CSharpOptions) -> String {
     let mut output = String::with_capacity(input.len());
     let chars = input.chars().collect::<Vec<_>>();
     let mut index = 0usize;
@@ -399,16 +416,11 @@ fn normalize_token_spacing(input: &str, options: &CSharpOptions) -> String {
                     continue;
                 }
 
-                if ch == '"' || starts_verbatim_string(&chars, index) {
-                    let verbatim = starts_verbatim_string(&chars, index);
-                    if verbatim {
-                        output.push('@');
-                        output.push('"');
-                        index += 2;
-                    } else {
-                        output.push(ch);
-                        index += 1;
+                if let Some((literal_len, verbatim)) = string_literal_start(&chars, index) {
+                    for offset in 0..literal_len {
+                        output.push(chars[index + offset]);
                     }
+                    index += literal_len;
                     state = CodeState::String { verbatim };
                     line_start = false;
                     continue;
@@ -422,65 +434,14 @@ fn normalize_token_spacing(input: &str, options: &CSharpOptions) -> String {
                     continue;
                 }
 
-                if ch == ',' {
-                    write_separator_spacing(
-                        &mut output,
-                        &chars,
-                        &mut index,
-                        ',',
-                        options.space_before_comma,
-                        options.space_after_comma,
-                    );
-                    line_start = false;
-                    continue;
-                }
-
-                if ch == '.' {
-                    write_separator_spacing(
-                        &mut output,
-                        &chars,
-                        &mut index,
-                        '.',
-                        options.space_before_dot,
-                        options.space_after_dot,
-                    );
-                    line_start = false;
-                    continue;
-                }
-
-                if ch == ';' {
-                    write_separator_spacing(
-                        &mut output,
-                        &chars,
-                        &mut index,
-                        ';',
-                        options.space_before_semicolon_in_for,
-                        options.space_after_semicolon_in_for,
-                    );
-                    line_start = false;
-                    continue;
-                }
-
-                if matches!(ch, '(' | '[') {
-                    write_open_bracket_spacing(&mut output, &chars, &mut index, ch);
-                    line_start = false;
-                    continue;
-                }
-
-                if matches!(ch, ')' | ']') {
-                    trim_horizontal_space(&mut output);
-                    output.push(ch);
-                    index += 1;
-                    line_start = false;
-                    continue;
-                }
-
-                if options.space_around_binary_operators {
-                    if let Some(operator_len) = binary_operator_len(&chars, index) {
-                        write_operator_spacing(&mut output, &chars, &mut index, operator_len);
-                        line_start = false;
-                        continue;
+                if let Some(keyword_len) = control_keyword_before_paren_len(&chars, index) {
+                    for offset in 0..keyword_len {
+                        output.push(chars[index + offset]);
                     }
+                    output.push(' ');
+                    index += keyword_len;
+                    line_start = false;
+                    continue;
                 }
 
                 output.push(ch);
@@ -545,8 +506,36 @@ fn normalize_token_spacing(input: &str, options: &CSharpOptions) -> String {
     output
 }
 
-fn starts_verbatim_string(chars: &[char], index: usize) -> bool {
-    chars.get(index) == Some(&'@') && chars.get(index + 1) == Some(&'"')
+fn string_literal_start(chars: &[char], index: usize) -> Option<(usize, bool)> {
+    match (chars.get(index), chars.get(index + 1), chars.get(index + 2)) {
+        (Some('"'), _, _) => Some((1, false)),
+        (Some('@'), Some('"'), _) => Some((2, true)),
+        (Some('$'), Some('"'), _) => Some((2, false)),
+        (Some('@'), Some('$'), Some('"')) => Some((3, true)),
+        (Some('$'), Some('@'), Some('"')) => Some((3, true)),
+        _ => None,
+    }
+}
+
+fn control_keyword_before_paren_len(chars: &[char], index: usize) -> Option<usize> {
+    const KEYWORDS: &[&str] = &[
+        "foreach", "for", "if", "while", "switch", "catch", "using", "lock", "fixed", "when",
+    ];
+
+    KEYWORDS.iter().find_map(|keyword| {
+        let len = keyword.len();
+        (chars_start_with(chars, index, keyword)
+            && keyword_boundary_before(chars, index)
+            && chars.get(index + len) == Some(&'('))
+        .then_some(len)
+    })
+}
+
+fn keyword_boundary_before(chars: &[char], index: usize) -> bool {
+    index == 0
+        || chars
+            .get(index - 1)
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && *ch != '_')
 }
 
 fn copy_until_newline(chars: &[char], mut index: usize, output: &mut String) -> usize {
@@ -560,6 +549,7 @@ fn copy_until_newline(chars: &[char], mut index: usize, output: &mut String) -> 
     index
 }
 
+#[allow(dead_code)]
 fn write_separator_spacing(
     output: &mut String,
     chars: &[char],
@@ -580,6 +570,7 @@ fn write_separator_spacing(
     }
 }
 
+#[allow(dead_code)]
 fn write_operator_spacing(
     output: &mut String,
     chars: &[char],
@@ -600,6 +591,7 @@ fn write_operator_spacing(
     }
 }
 
+#[allow(dead_code)]
 fn write_open_bracket_spacing(
     output: &mut String,
     chars: &[char],
@@ -624,6 +616,7 @@ fn trim_horizontal_space(output: &mut String) {
     }
 }
 
+#[allow(dead_code)]
 fn previous_word(output: &str) -> Option<&str> {
     let trimmed = output.trim_end_matches([' ', '\t']);
     let end = trimmed.len();
@@ -638,6 +631,7 @@ fn previous_word(output: &str) -> Option<&str> {
     trimmed.get(start..end)
 }
 
+#[allow(dead_code)]
 fn is_control_keyword(word: &str) -> bool {
     matches!(
         word,
@@ -645,12 +639,14 @@ fn is_control_keyword(word: &str) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn skip_horizontal_space(chars: &[char], index: &mut usize) {
     while matches!(chars.get(*index), Some(' ' | '\t')) {
         *index += 1;
     }
 }
 
+#[allow(dead_code)]
 fn needs_space_before(output: &str) -> bool {
     output
         .chars()
@@ -658,12 +654,14 @@ fn needs_space_before(output: &str) -> bool {
         .is_some_and(|ch| !ch.is_whitespace() && ch != '(' && ch != '[' && ch != '{')
 }
 
+#[allow(dead_code)]
 fn needs_space_after(chars: &[char], index: usize) -> bool {
     chars
         .get(index)
         .is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, ')' | ']' | '}' | ';' | ','))
 }
 
+#[allow(dead_code)]
 fn binary_operator_len(chars: &[char], index: usize) -> Option<usize> {
     let current = *chars.get(index)?;
     let next = chars.get(index + 1).copied();
@@ -693,6 +691,7 @@ fn binary_operator_len(chars: &[char], index: usize) -> Option<usize> {
     }
 }
 
+#[allow(dead_code)]
 fn previous_non_space(chars: &[char], index: usize) -> Option<char> {
     chars
         .get(..index)?
@@ -702,6 +701,7 @@ fn previous_non_space(chars: &[char], index: usize) -> Option<char> {
         .copied()
 }
 
+#[allow(dead_code)]
 fn can_precede_binary_plus_or_minus(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | ')' | ']' | '}')
 }
@@ -742,16 +742,11 @@ fn normalize_control_flow_newlines(input: &str, options: &CSharpOptions) -> Stri
                     continue;
                 }
 
-                if ch == '"' || starts_verbatim_string(&chars, index) {
-                    let verbatim = starts_verbatim_string(&chars, index);
-                    if verbatim {
-                        output.push('@');
-                        output.push('"');
-                        index += 2;
-                    } else {
-                        output.push(ch);
-                        index += 1;
+                if let Some((literal_len, verbatim)) = string_literal_start(&chars, index) {
+                    for offset in 0..literal_len {
+                        output.push(chars[index + offset]);
                     }
+                    index += literal_len;
                     state = CodeState::String { verbatim };
                     continue;
                 }
@@ -936,7 +931,7 @@ mod tests {
 
         assert_eq!(
             format_csharp(input, options()),
-            "using System;\nusing System.Text;\n\nusing Elsa;\n\nclass C {}\n"
+            "using System;\nusing System.Text;\nusing Elsa;\n\nclass C {}\n"
         );
     }
 
@@ -946,7 +941,7 @@ mod tests {
 
         assert_eq!(
             format_csharp(input, options()),
-            "using System;\n\nusing R3;\n\nusing Range = Microsoft.Office.Interop.Word.Range;\nusing Task = System.Threading.Tasks.Task;\n\nnamespace N {}\n"
+            "using System;\nusing R3;\n\nusing Task = System.Threading.Tasks.Task;\nusing Range = Microsoft.Office.Interop.Word.Range;\n\nnamespace N {}\n"
         );
     }
 
@@ -989,18 +984,17 @@ mod tests {
 
         assert_eq!(
             format_csharp(input, options()),
-            "class C\n{\n    void M(){ var x = a + b; Call(a, b, c); for (i = 0; i<10; i += 1){} }\n}\n"
+            "class C\n{\n    void M(){ var x=a+b; Call( a ,b,c ); for (i=0;i<10;i+=1){} }\n}\n"
         );
     }
 
     #[test]
     fn leaves_comments_and_strings_unchanged() {
-        let input =
-            "class C\n{\n    string S = \"a,b+c\"; // x,y+z\n    string V = @\"a,b+c\";\n}\n";
+        let input = "class C\n{\n    string S = \"if(x)\"; // if(x)\n    string V = @\"for(x)\";\n    string I = $@\"when(x)\";\n}\n";
 
         assert_eq!(
             format_csharp(input, options()),
-            "class C\n{\n    string S = \"a,b+c\"; // x,y+z\n    string V = @\"a,b+c\";\n}\n"
+            "class C\n{\n    string S = \"if(x)\"; // if(x)\n    string V = @\"for(x)\";\n    string I = $@\"when(x)\";\n}\n"
         );
     }
 
