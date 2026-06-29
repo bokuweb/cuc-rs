@@ -26,7 +26,7 @@ pub struct CSharpOptions {
 impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
-            sort_usings: true,
+            sort_usings: false,
             reorder_modifiers: false,
             normalize_spacing: false,
             normalize_newlines: true,
