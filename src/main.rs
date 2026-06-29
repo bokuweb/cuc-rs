@@ -79,6 +79,9 @@ fn main() -> Result<()> {
         if properties.is_empty() {
             continue;
         }
+        if (cli.csharp || cli.csharp_newlines) && is_generated_csharp_file(&relative_path) {
+            continue;
+        }
 
         let metadata =
             fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
@@ -175,6 +178,17 @@ fn is_skipped_dir(path: &Path) -> bool {
                     | "packages"
                     | "target"
             )
+        })
+}
+
+fn is_generated_csharp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with(".Designer.cs")
+                || name.ends_with(".g.cs")
+                || name.ends_with(".g.i.cs")
+                || name.ends_with(".AssemblyInfo.cs")
         })
 }
 

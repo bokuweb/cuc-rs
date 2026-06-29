@@ -151,8 +151,15 @@ fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
     let mut output = Vec::new();
     let lines: Vec<&str> = input.split('\n').collect();
     let mut index = 0usize;
+    let mut in_header = true;
 
     while index < lines.len() {
+        if !in_header {
+            output.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+
         if is_using_directive(lines[index]) {
             let start = index;
             while index < lines.len()
@@ -166,12 +173,26 @@ fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
             }
             output.extend(format_using_block(&lines[start..index], options));
         } else {
+            if !is_header_trivia(lines[index]) {
+                in_header = false;
+            }
             output.push(lines[index].to_string());
             index += 1;
         }
     }
 
     output.join("\n")
+}
+
+fn is_header_trivia(line: &str) -> bool {
+    let trimmed = line.trim_start_matches('\u{feff}').trim_start();
+
+    trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('#')
 }
 
 fn next_nonblank_is_using_alias_directive(lines: &[&str], mut index: usize) -> bool {
@@ -936,6 +957,17 @@ mod tests {
         options.normalize_spacing = false;
 
         let input = "using System.Net.Http;\nusing System.Text;\n\nclass C\n{\n    async System.Threading.Tasks.Task M(System.Uri endpoint, HttpClient client, string json, System.Threading.CancellationToken cancellationToken)\n    {\n        using StringContent content = new StringContent(json, Encoding.UTF8, \"application/json\");\n        using HttpResponseMessage response = await client.PostAsync(endpoint, content, cancellationToken);\n    }\n}\n";
+
+        assert_eq!(format_csharp(input, options), input);
+    }
+
+    #[test]
+    fn does_not_sort_using_text_after_header() {
+        let mut options = options();
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+
+        let input = "namespace N\n{\n    class C\n    {\n        const string Source = @\"\nusing System.Threading;\nusing Microsoft.Office.Interop.Word;\n\";\n    }\n}\n";
 
         assert_eq!(format_csharp(input, options), input);
     }
