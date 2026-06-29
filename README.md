@@ -2,6 +2,11 @@
 
 `cuc` is a prototype fast cleanup and formatter tool driven by `.editorconfig`.
 
+> **Warning**
+>
+> This project is experimental. Do not use it for production formatting or as a
+> replacement for CI-enforced ReSharper `cleanupcode`.
+
 It is not a ReSharper `cleanupcode` replacement yet. The current target is a
 fast formatter core. Basic text cleanup is available behind `--text`:
 
@@ -12,12 +17,14 @@ fast formatter core. Basic text cleanup is available behind `--text`:
 - optional leading indentation conversion via `--indent`
 
 Experimental C# formatter passes are available behind `--csharp`.
+Newline-only C# checks are available behind `--csharp-newlines`.
 
 - `using` directive sorting and duplicate removal
 - modifier ordering via `csharp_preferred_modifier_order`
-- token spacing for comma, dot, semicolon, selected binary operators, and
-  parentheses/brackets
 - new lines before `else`, `catch`, and `finally`
+
+Broad token spacing rewrites are not enabled in `--csharp` yet. They need a
+syntax-aware implementation before they are safe enough to apply to real C#.
 
 Unused `using` removal is intentionally not implemented yet because it needs a
 semantic model.
@@ -27,6 +34,7 @@ semantic model.
 ```sh
 cargo run -- --config ../elsa/.editorconfig --text ../elsa/Elsa --check --list
 cargo run -- --config ../elsa/.editorconfig --text ../elsa/Elsa --list
+cargo run -- --config ../elsa/.editorconfig --csharp-newlines ../elsa/Elsa --check --list
 cargo run -- --config ../elsa/.editorconfig --text --csharp ../elsa/Elsa --check --list
 ```
 

@@ -4,6 +4,10 @@ use crate::editorconfig::Properties;
 
 #[derive(Debug, Clone)]
 pub struct CSharpOptions {
+    pub sort_usings: bool,
+    pub reorder_modifiers: bool,
+    pub normalize_spacing: bool,
+    pub normalize_newlines: bool,
     pub sort_system_directives_first: bool,
     pub separate_import_directive_groups: bool,
     pub modifier_order: Vec<String>,
@@ -22,6 +26,10 @@ pub struct CSharpOptions {
 impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
+            sort_usings: true,
+            reorder_modifiers: true,
+            normalize_spacing: false,
+            normalize_newlines: true,
             sort_system_directives_first: properties
                 .get("dotnet_sort_system_directives_first")
                 .map(|value| value == "true")
@@ -58,13 +66,38 @@ impl CSharpOptions {
             ),
         }
     }
+
+    pub fn newlines_from_properties(properties: &Properties) -> Self {
+        let mut options = Self::from_properties(properties);
+        options.sort_usings = false;
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+        options.normalize_newlines = true;
+        options
+    }
 }
 
 pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
-    let input = sort_using_blocks(input, &options);
-    let input = reorder_modifiers(&input, &options);
-    let input = normalize_token_spacing(&input, &options);
-    normalize_control_flow_newlines(&input, &options)
+    let input = if options.sort_usings {
+        sort_using_blocks(input, &options)
+    } else {
+        input.to_string()
+    };
+    let input = if options.reorder_modifiers {
+        reorder_modifiers(&input, &options)
+    } else {
+        input
+    };
+    let input = if options.normalize_spacing {
+        normalize_token_spacing(&input, &options)
+    } else {
+        input
+    };
+    if options.normalize_newlines {
+        normalize_control_flow_newlines(&input, &options)
+    } else {
+        input
+    }
 }
 
 fn bool_property(properties: &Properties, key: &str, default: bool) -> bool {
@@ -626,58 +659,181 @@ fn can_precede_binary_plus_or_minus(ch: char) -> bool {
 }
 
 fn normalize_control_flow_newlines(input: &str, options: &CSharpOptions) -> String {
-    input
-        .split('\n')
-        .flat_map(|line| split_control_flow_line(line, options))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+    let mut output = String::with_capacity(input.len());
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut state = CodeState::Normal;
+    let mut line_start = true;
+    let mut current_indent = String::new();
 
-fn split_control_flow_line(line: &str, options: &CSharpOptions) -> Vec<String> {
-    let mut pending = vec![line.to_string()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut next = Vec::new();
-        for line in pending {
-            let split = split_one_control_flow_line(&line, options);
-            if split.len() > 1 {
-                changed = true;
+    while index < chars.len() {
+        let ch = chars[index];
+        match state {
+            CodeState::Normal => {
+                if line_start {
+                    if matches!(ch, ' ' | '\t') {
+                        current_indent.push(ch);
+                    } else {
+                        line_start = false;
+                    }
+                }
+
+                if ch == '/' && chars.get(index + 1) == Some(&'/') {
+                    output.push(ch);
+                    output.push('/');
+                    index += 2;
+                    state = CodeState::LineComment;
+                    continue;
+                }
+
+                if ch == '/' && chars.get(index + 1) == Some(&'*') {
+                    output.push(ch);
+                    output.push('*');
+                    index += 2;
+                    state = CodeState::BlockComment;
+                    continue;
+                }
+
+                if ch == '"' || starts_verbatim_string(&chars, index) {
+                    let verbatim = starts_verbatim_string(&chars, index);
+                    if verbatim {
+                        output.push('@');
+                        output.push('"');
+                        index += 2;
+                    } else {
+                        output.push(ch);
+                        index += 1;
+                    }
+                    state = CodeState::String { verbatim };
+                    continue;
+                }
+
+                if ch == '\'' {
+                    output.push(ch);
+                    index += 1;
+                    state = CodeState::Char;
+                    continue;
+                }
+
+                if let Some(keyword_len) = control_flow_keyword_len(&chars, index, options) {
+                    if previous_output_non_space_on_current_line(&output) == Some('}') {
+                        trim_horizontal_space(&mut output);
+                        output.push('\n');
+                        output.push_str(&current_indent);
+                        for offset in 1..keyword_len {
+                            output.push(chars[index + offset]);
+                        }
+                        index += keyword_len;
+                        line_start = false;
+                        continue;
+                    }
+                }
+
+                output.push(ch);
+                index += 1;
+                if ch == '\n' {
+                    line_start = true;
+                    current_indent.clear();
+                }
             }
-            next.extend(split);
+            CodeState::LineComment => {
+                output.push(ch);
+                index += 1;
+                if ch == '\n' {
+                    state = CodeState::Normal;
+                    line_start = true;
+                    current_indent.clear();
+                }
+            }
+            CodeState::BlockComment => {
+                output.push(ch);
+                if ch == '*' && chars.get(index + 1) == Some(&'/') {
+                    output.push('/');
+                    index += 2;
+                    state = CodeState::Normal;
+                } else {
+                    index += 1;
+                }
+                if ch == '\n' {
+                    line_start = true;
+                    current_indent.clear();
+                }
+            }
+            CodeState::String { verbatim } => {
+                output.push(ch);
+                if verbatim && ch == '"' && chars.get(index + 1) == Some(&'"') {
+                    output.push('"');
+                    index += 2;
+                    continue;
+                }
+                if ch == '"' {
+                    state = CodeState::Normal;
+                } else if !verbatim && ch == '\\' {
+                    if let Some(next) = chars.get(index + 1) {
+                        output.push(*next);
+                        index += 2;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+            CodeState::Char => {
+                output.push(ch);
+                if ch == '\'' {
+                    state = CodeState::Normal;
+                } else if ch == '\\' {
+                    if let Some(next) = chars.get(index + 1) {
+                        output.push(*next);
+                        index += 2;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
         }
-        pending = next;
     }
-    pending
+
+    output
 }
 
-fn split_one_control_flow_line(line: &str, options: &CSharpOptions) -> Vec<String> {
-    let rules = [
+fn control_flow_keyword_len(
+    chars: &[char],
+    index: usize,
+    options: &CSharpOptions,
+) -> Option<usize> {
+    [
         (" else", options.new_line_before_else),
         (" catch", options.new_line_before_catch),
         (" finally", options.new_line_before_finally),
-    ];
+    ]
+    .into_iter()
+    .find_map(|(keyword, enabled)| {
+        (enabled
+            && chars_start_with(chars, index, keyword)
+            && keyword_boundary(chars, index + keyword.len()))
+        .then_some(keyword.len())
+    })
+}
 
-    for (needle, enabled) in rules {
-        if !enabled {
-            continue;
-        }
-        let Some(position) = line.find(needle) else {
-            continue;
-        };
-        if !line[..position].trim_end().ends_with('}') {
-            continue;
-        }
+fn chars_start_with(chars: &[char], index: usize, pattern: &str) -> bool {
+    pattern
+        .chars()
+        .enumerate()
+        .all(|(offset, ch)| chars.get(index + offset) == Some(&ch))
+}
 
-        let indent = line
-            .get(..line.len() - line.trim_start().len())
-            .unwrap_or("");
-        let first = line[..position].trim_end().to_string();
-        let second = format!("{indent}{}", line[position + 1..].trim_start());
-        return vec![first, second];
-    }
+fn keyword_boundary(chars: &[char], index: usize) -> bool {
+    chars
+        .get(index)
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && *ch != '_')
+}
 
-    vec![line.to_string()]
+fn previous_output_non_space_on_current_line(output: &str) -> Option<char> {
+    output
+        .chars()
+        .rev()
+        .take_while(|ch| !matches!(ch, '\n' | '\r'))
+        .find(|ch| !matches!(ch, ' ' | '\t'))
 }
 
 #[cfg(test)]
@@ -686,6 +842,10 @@ mod tests {
 
     fn options() -> CSharpOptions {
         CSharpOptions {
+            sort_usings: true,
+            reorder_modifiers: true,
+            normalize_spacing: true,
+            normalize_newlines: true,
             sort_system_directives_first: true,
             separate_import_directive_groups: true,
             space_after_comma: true,
@@ -772,5 +932,47 @@ mod tests {
             format_csharp(input, options()),
             "class C\n{\n    void M(){ if (x){}\n    else {} try {}\n    catch {}\n    finally {} }\n}\n"
         );
+    }
+
+    #[test]
+    fn can_run_only_newline_passes() {
+        let mut options = options();
+        options.sort_usings = false;
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+
+        let input = "using Z;\nusing A;\nclass C\n{\n    static private string Value;\n    void M(){ if(x){} else {} }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options),
+            "using Z;\nusing A;\nclass C\n{\n    static private string Value;\n    void M(){ if(x){}\n    else {} }\n}\n"
+        );
+    }
+
+    #[test]
+    fn newline_pass_ignores_comments_and_strings() {
+        let mut options = options();
+        options.sort_usings = false;
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+
+        let input = "class C\n{\n    string Script = \"try {} catch (_) {}\";\n    // } catch (_) {\n    void M(){ try {} catch {} }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options),
+            "class C\n{\n    string Script = \"try {} catch (_) {}\";\n    // } catch (_) {\n    void M(){ try {}\n    catch {} }\n}\n"
+        );
+    }
+
+    #[test]
+    fn newline_pass_does_not_add_blank_line_before_existing_catch() {
+        let mut options = options();
+        options.sort_usings = false;
+        options.reorder_modifiers = false;
+        options.normalize_spacing = false;
+
+        let input = "class C\n{\n    void M()\n    {\n        try\n        {\n        }\n        catch\n        {\n        }\n    }\n}\n";
+
+        assert_eq!(format_csharp(input, options), input);
     }
 }

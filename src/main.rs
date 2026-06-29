@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long)]
     csharp: bool,
 
+    /// Enable only experimental C# newline formatter passes.
+    #[arg(long)]
+    csharp_newlines: bool,
+
     /// Skip files larger than this many bytes.
     #[arg(long, default_value_t = 2 * 1024 * 1024)]
     max_bytes: u64,
@@ -92,6 +96,7 @@ fn main() -> Result<()> {
             cli.text,
             cli.indent,
             cli.csharp,
+            cli.csharp_newlines,
             &relative_path,
         );
         let output = format_text(&input, options);

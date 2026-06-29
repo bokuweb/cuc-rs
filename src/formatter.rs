@@ -41,6 +41,7 @@ impl FormatOptions {
         include_text: bool,
         include_indent: bool,
         include_csharp: bool,
+        include_csharp_newlines: bool,
         path: &Path,
     ) -> Self {
         let trim_trailing_whitespace = include_text
@@ -68,12 +69,20 @@ impl FormatOptions {
         } else {
             None
         };
-        let csharp = include_csharp.then_some(()).and_then(|()| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
-                .then(|| CSharpOptions::from_properties(properties))
-        });
+        let csharp = (include_csharp || include_csharp_newlines)
+            .then_some(())
+            .and_then(|()| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
+                    .then(|| {
+                        if include_csharp {
+                            CSharpOptions::from_properties(properties)
+                        } else {
+                            CSharpOptions::newlines_from_properties(properties)
+                        }
+                    })
+            });
 
         Self {
             trim_trailing_whitespace,
@@ -146,14 +155,6 @@ pub fn format_text(input: &str, options: FormatOptions) -> String {
     output
 }
 
-fn parse_bool(value: Option<&str>) -> Option<bool> {
-    match value {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    }
-}
-
 fn parse_indent(properties: &Properties) -> Option<IndentOptions> {
     let style = match properties.get("indent_style") {
         Some("space") => IndentStyle::Space,
@@ -180,6 +181,14 @@ fn parse_indent(properties: &Properties) -> Option<IndentOptions> {
         size,
         tab_width,
     })
+}
+
+fn parse_bool(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
 }
 
 fn detect_eol(text: &str) -> EndOfLine {
