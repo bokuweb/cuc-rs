@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      parity_scope:
+        description: Compare current Elsa HEAD only, or run the full historical certification suite
+        required: true
+        type: choice
+        options:
+          - current
+          - full
+        default: current
+      elsa_ref:
+        description: Elsa branch, tag, or commit to use as HEAD
+        required: true
+        default: main
+      elsa_commits:
+        description: Comma-separated cleanup commits to compare
+        required: true
+        default: 707462a1,0c89eafe,4885d63f,77333053,feb665cf,5ab9d74d,ccb349cd,5943da6f,fb35adf8,e49644da,77f08898,11c8b506,99f358a9,d41d2cbf,7ca522416,3c9b17764,24cd81bbd,30f92748c
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  elsa-parity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cuc-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: jlsi/elsa
+          fetch-depth: 0
+          path: elsa
+          ref: ${{ inputs.elsa_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cuc
+        working-directory: cuc-rs
+        run: cargo build --release
+      - name: Install ReSharper command line tools
+        shell: pwsh
+        run: dotnet tool install JetBrains.ReSharper.GlobalTools --version 2025.1.2 --tool-path tools
+      - name: Compare with cleanupcode
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}\tools;$env:PATH"
+          $commits = "${{ inputs.elsa_commits }}".Split(',')
+          $currentOnly = "${{ inputs.parity_scope }}" -eq "current"
+          ./cuc-rs/scripts/compare-elsa-cleanup.ps1 `
+            -ElsaRepo ./elsa `
+            -CucExe ./cuc-rs/target/release/cuc.exe `
+            -Commit $commits `
+            -ReportDirectory ./parity-reports `
+            -CurrentOnly:$currentOnly `
+            -KeepGoing
+      - name: Upload parity reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elsa-parity-reports
+          path: parity-reports
+          if-no-files-found: ignore

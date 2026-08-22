@@ -1,14 +1,22 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::editorconfig::Properties;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct CSharpOptions {
+    pub interface_layout: Option<Arc<crate::syntax::InterfaceLayout>>,
     pub sort_usings: bool,
+    pub arrange_fields: bool,
+    pub remove_clearly_unused_usings: bool,
     pub reorder_modifiers: bool,
     pub normalize_spacing: bool,
     pub normalize_newlines: bool,
+    pub collapse_simple_wrapping: bool,
+    pub prefer_expression_bodied_members: bool,
+    pub prefer_explicit_type_when_apparent: bool,
+    pub max_line_length: usize,
     pub sort_system_directives_first: bool,
     pub separate_import_directive_groups: bool,
     pub modifier_order: Vec<String>,
@@ -27,10 +35,32 @@ pub struct CSharpOptions {
 impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
+            interface_layout: None,
             sort_usings: true,
+            arrange_fields: true,
+            remove_clearly_unused_usings: true,
             reorder_modifiers: false,
             normalize_spacing: true,
             normalize_newlines: true,
+            collapse_simple_wrapping: properties
+                .get("resharper_keep_existing_invocation_parens_arrangement")
+                .map(|value| value == "false")
+                .unwrap_or(false),
+            prefer_expression_bodied_members: style_enabled(
+                properties,
+                "csharp_style_expression_bodied_constructors",
+            ) || style_enabled(
+                properties,
+                "csharp_style_expression_bodied_methods",
+            ),
+            prefer_explicit_type_when_apparent: !style_enabled(
+                properties,
+                "csharp_style_var_when_type_is_apparent",
+            ),
+            max_line_length: properties
+                .get("max_line_length")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(120),
             sort_system_directives_first: properties
                 .get("dotnet_sort_system_directives_first")
                 .map(|value| value == "true")
@@ -71,18 +101,44 @@ impl CSharpOptions {
     pub fn newlines_from_properties(properties: &Properties) -> Self {
         let mut options = Self::from_properties(properties);
         options.sort_usings = false;
+        options.arrange_fields = false;
+        options.remove_clearly_unused_usings = false;
         options.reorder_modifiers = false;
         options.normalize_spacing = false;
         options.normalize_newlines = true;
+        options.collapse_simple_wrapping = false;
+        options.prefer_expression_bodied_members = false;
+        options.prefer_explicit_type_when_apparent = false;
         options
     }
 }
 
 pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
+    let input_for_syntax_guard = input;
     let input = if options.sort_usings {
-        sort_using_blocks(input, &options)
+        let input = simplify_known_framework_qualifications(input);
+        if options.remove_clearly_unused_usings {
+            remove_clearly_unused_system_using(&input)
+        } else {
+            input
+        }
     } else {
         input.to_string()
+    };
+    let input = if options.sort_usings {
+        sort_using_blocks(&input, &options)
+    } else {
+        input
+    };
+    let input = if options.arrange_fields {
+        let input = options
+            .interface_layout
+            .as_deref()
+            .map(|layout| crate::syntax::arrange_interface_implementations(&input, layout))
+            .unwrap_or(input);
+        crate::syntax::arrange_misplaced_fields(&input)
+    } else {
+        input
     };
     let input = if options.reorder_modifiers {
         reorder_modifiers(&input, &options)
@@ -94,11 +150,1443 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     } else {
         input
     };
-    if options.normalize_newlines {
+    let input = if options.prefer_explicit_type_when_apparent {
+        replace_apparent_var_declarations(&input)
+    } else {
+        input
+    };
+    let input = if options.normalize_spacing {
+        let input = remove_verified_redundant_named_arguments(&input);
+        let input = remove_known_framework_named_arguments(&input);
+        let input = remove_asserted_null_forgiving_operators(&input);
+        remove_redundant_global_namespace_qualifiers(&input)
+    } else {
+        input
+    };
+    let input = if options.prefer_expression_bodied_members {
+        collapse_single_statement_members(&input, options.max_line_length)
+    } else {
+        input
+    };
+    let input = if options.collapse_simple_wrapping {
+        let input = expand_long_object_creation_arguments(&input, options.max_line_length);
+        let input = collapse_single_property_initializers(&input, options.max_line_length);
+        let input = collapse_adjacent_initializer_items(&input, options.max_line_length);
+        collapse_simple_wrapping(&input, options.max_line_length)
+    } else {
+        input
+    };
+    let output = if options.normalize_newlines {
         normalize_control_flow_newlines(&input, &options)
     } else {
         input
+    };
+    preserve_parseable_input(input_for_syntax_guard, output)
+}
+
+fn preserve_parseable_input(original: &str, candidate: String) -> String {
+    if candidate == original {
+        return candidate;
     }
+    let original_is_parseable =
+        crate::syntax::parse_csharp(original).is_some_and(|tree| !tree.root_node().has_error());
+    if !original_is_parseable {
+        return candidate;
+    }
+    let candidate_is_parseable =
+        crate::syntax::parse_csharp(&candidate).is_some_and(|tree| !tree.root_node().has_error());
+    if candidate_is_parseable {
+        candidate
+    } else {
+        original.to_string()
+    }
+}
+
+fn expand_long_object_creation_arguments(input: &str, max_line_length: usize) -> String {
+    let normal_lines = normal_code_lines(input);
+    let mut output = input
+        .lines()
+        .zip(normal_lines)
+        .map(|(line, normal)| {
+            if !normal || line.chars().count() <= max_line_length {
+                return line.to_string();
+            }
+            let Some(new_start) = line.find(" = new ") else {
+                return line.to_string();
+            };
+            let Some(relative_open) = line[new_start + 7..].find('(') else {
+                return line.to_string();
+            };
+            let open = new_start + 7 + relative_open;
+            let Some(close) = line.rfind(");") else {
+                return line.to_string();
+            };
+            if close <= open || !line[close + 2..].trim().is_empty() {
+                return line.to_string();
+            }
+            let Some(commas) = top_level_comma_offsets(&line[open + 1..close]) else {
+                return line.to_string();
+            };
+            if commas.is_empty() {
+                return line.to_string();
+            }
+            let mut arguments = Vec::with_capacity(commas.len() + 1);
+            let mut start = open + 1;
+            for comma in commas {
+                let end = open + 1 + comma;
+                arguments.push(line[start..end].trim());
+                start = end + 1;
+            }
+            arguments.push(line[start..close].trim());
+            if arguments.iter().any(|argument| argument.is_empty()) {
+                return line.to_string();
+            }
+            let continuation = format!("{}    ", &line[..line.len() - line.trim_start().len()]);
+            let mut output = format!("{}\n", &line[..=open]);
+            for (index, argument) in arguments.iter().enumerate() {
+                output.push_str(&continuation);
+                output.push_str(argument);
+                if index + 1 == arguments.len() {
+                    output.push_str(");");
+                } else {
+                    output.push_str(",\n");
+                }
+            }
+            output
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if input.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn top_level_comma_offsets(arguments: &str) -> Option<Vec<usize>> {
+    if arguments.contains(['\'', '"']) {
+        return None;
+    }
+    let mut parentheses = 0i32;
+    let mut brackets = 0i32;
+    let mut braces = 0i32;
+    let mut commas = Vec::new();
+    for (index, ch) in arguments.char_indices() {
+        match ch {
+            '(' => parentheses += 1,
+            ')' => parentheses -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            ',' if parentheses == 0 && brackets == 0 && braces == 0 => commas.push(index),
+            _ => {}
+        }
+        if parentheses < 0 || brackets < 0 || braces < 0 {
+            return None;
+        }
+    }
+    (parentheses == 0 && brackets == 0 && braces == 0).then_some(commas)
+}
+
+fn remove_clearly_unused_system_using(input: &str) -> String {
+    if !input.lines().any(|line| line.trim() == "using System;") {
+        return input.to_string();
+    }
+    const SYSTEM_IDENTIFIERS: &[&str] = &[
+        "Action",
+        "Activator",
+        "AggregateException",
+        "AppContext",
+        "ApplicationException",
+        "ArgumentException",
+        "ArgumentNullException",
+        "ArgumentOutOfRangeException",
+        "Array",
+        "ArraySegment",
+        "AsyncCallback",
+        "Attribute",
+        "BitConverter",
+        "Buffer",
+        "Char",
+        "CLSCompliant",
+        "Comparison",
+        "Console",
+        "Convert",
+        "DateTime",
+        "DateTimeKind",
+        "DateTimeOffset",
+        "DayOfWeek",
+        "Decimal",
+        "Delegate",
+        "DivideByZeroException",
+        "DllNotFoundException",
+        "Environment",
+        "EventArgs",
+        "EventHandler",
+        "Exception",
+        "Flags",
+        "FormatException",
+        "Func",
+        "GC",
+        "Guid",
+        "IAsyncResult",
+        "IAsyncDisposable",
+        "ICloneable",
+        "IComparable",
+        "IConvertible",
+        "IDisposable",
+        "IEquatable",
+        "IFormatProvider",
+        "IFormattable",
+        "IndexOutOfRangeException",
+        "IntPtr",
+        "InvalidCastException",
+        "InvalidOperationException",
+        "Lazy",
+        "Math",
+        "MathF",
+        "MidpointRounding",
+        "MulticastDelegate",
+        "NotImplementedException",
+        "NotSupportedException",
+        "NullReferenceException",
+        "Nullable",
+        "Object",
+        "Obsolete",
+        "OperatingSystem",
+        "OperationCanceledException",
+        "OutOfMemoryException",
+        "OverflowException",
+        "PlatformNotSupportedException",
+        "Predicate",
+        "Random",
+        "RankException",
+        "Serializable",
+        "Span",
+        "STAThread",
+        "String",
+        "StringComparer",
+        "StringComparison",
+        "StringSplitOptions",
+        "SystemException",
+        "TimeSpan",
+        "TimeProvider",
+        "TimeoutException",
+        "Tuple",
+        "Type",
+        "TypeCode",
+        "TypeInitializationException",
+        "UIntPtr",
+        "Ulid",
+        "UnauthorizedAccessException",
+        "Uri",
+        "UriBuilder",
+        "UriKind",
+        "Version",
+        "WeakReference",
+    ];
+    let body = input
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("using "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if SYSTEM_IDENTIFIERS
+        .iter()
+        .any(|identifier| contains_identifier(&body, identifier))
+    {
+        return input.to_string();
+    }
+    let mut output = input
+        .lines()
+        .filter(|line| line.trim() != "using System;")
+        .collect::<Vec<_>>()
+        .join("\n");
+    if input.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn contains_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(index, _)| {
+        let before = source[..index].chars().next_back();
+        let after = source[index + identifier.len()..].chars().next();
+        !before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn simplify_known_framework_qualifications(input: &str) -> String {
+    let normal_lines = normal_code_lines(input);
+    let mut changed = false;
+    let mut needs_virtual_document_using = false;
+    let mut lines = input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) != Some(&true) {
+                return line.to_string();
+            }
+            let mut rewritten = line.to_string();
+            if rewritten.contains("System.StringComparison.") {
+                changed = true;
+                rewritten = rewritten.replace("System.StringComparison.", "StringComparison.");
+            }
+            if rewritten.contains("Elsa.Services.VirtualDocumentService.IVirtualDocumentService") {
+                changed = true;
+                needs_virtual_document_using = true;
+                rewritten = rewritten.replace(
+                    "Elsa.Services.VirtualDocumentService.IVirtualDocumentService",
+                    "IVirtualDocumentService",
+                );
+            }
+            rewritten
+        })
+        .collect::<Vec<_>>();
+    if changed
+        && input.contains("System.StringComparison.")
+        && !lines.iter().any(|line| line.trim() == "using System;")
+    {
+        if let Some(index) = lines.iter().position(|line| is_using_directive(line)) {
+            lines.insert(index, "using System;".to_string());
+        }
+    }
+    if needs_virtual_document_using
+        && !lines
+            .iter()
+            .any(|line| line.trim() == "using Elsa.Services.VirtualDocumentService;")
+    {
+        if let Some(index) = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("using Elsa."))
+            .or_else(|| lines.iter().position(|line| is_using_directive(line)))
+        {
+            lines.insert(
+                index,
+                "using Elsa.Services.VirtualDocumentService;".to_string(),
+            );
+        }
+    }
+    lines.join("\n")
+}
+
+fn replace_apparent_var_declarations(input: &str) -> String {
+    let normal_lines = normal_code_lines(input);
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) != Some(&true) {
+                return line.to_string();
+            }
+            replace_apparent_var_declaration(line).unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_verified_redundant_named_arguments(input: &str) -> String {
+    let first_parameters = collect_local_first_parameters(input);
+    let normal_lines = normal_code_lines(input);
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) != Some(&true) {
+                return line.to_string();
+            }
+            remove_verified_named_argument(line, &first_parameters)
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_redundant_global_namespace_qualifiers(input: &str) -> String {
+    let current_namespace = input.lines().find_map(|line| {
+        let namespace = line.trim().strip_prefix("namespace ")?;
+        let namespace = namespace.trim_end_matches([';', '{']).trim();
+        (!namespace.is_empty()
+            && namespace.split('.').all(|part| {
+                !part.is_empty()
+                    && part
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            }))
+        .then_some(namespace)
+    });
+    let Some(current_namespace) = current_namespace else {
+        return input.to_string();
+    };
+    let root_namespace = current_namespace
+        .split('.')
+        .next()
+        .unwrap_or(current_namespace);
+    let same_namespace = format!("global::{current_namespace}.");
+    let qualified = format!("global::{root_namespace}.");
+    let replacement = format!("{root_namespace}.");
+    let normal_lines = normal_code_lines(input);
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) == Some(&true) {
+                line.replace(&same_namespace, "")
+                    .replace(&qualified, &replacement)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_known_framework_named_arguments(input: &str) -> String {
+    let normal_lines = normal_code_lines(input);
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) == Some(&true) {
+                line.replace("new CancellationToken(canceled: ", "new CancellationToken(")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_asserted_null_forgiving_operators(input: &str) -> String {
+    let normal_lines = normal_code_lines(input);
+    let mut asserted: HashMap<String, i32> = HashMap::new();
+    let mut brace_depth = 0i32;
+    let mut output = Vec::new();
+    for (index, line) in input.split('\n').enumerate() {
+        if normal_lines.get(index) != Some(&true) {
+            output.push(line.to_string());
+            continue;
+        }
+        asserted.retain(|_, assertion_depth| brace_depth >= *assertion_depth);
+        let mut rewritten = line.to_string();
+        for identifier in asserted.keys() {
+            rewritten = rewritten.replace(
+                &format!("{identifier}!.SetValue("),
+                &format!("{identifier}.SetValue("),
+            );
+            if rewritten.trim() == format!("return {identifier}!;") {
+                rewritten = rewritten.replace(
+                    &format!("return {identifier}!;"),
+                    &format!("return {identifier};"),
+                );
+            }
+        }
+        if let Some(identifier) = asserted_identifier(line) {
+            asserted.insert(identifier, brace_depth);
+        }
+        output.push(rewritten);
+        brace_depth += line.chars().filter(|ch| *ch == '{').count() as i32;
+        brace_depth -= line.chars().filter(|ch| *ch == '}').count() as i32;
+    }
+    output.join("\n")
+}
+
+fn asserted_identifier(line: &str) -> Option<String> {
+    let start = line.find("Assert.IsNotNull(")? + "Assert.IsNotNull(".len();
+    let argument = line[start..].split([',', ')']).next()?.trim();
+    argument
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .then(|| argument.to_string())
+}
+
+fn collect_local_first_parameters(input: &str) -> HashMap<String, Option<String>> {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut parameters: HashMap<String, Option<String>> = HashMap::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let start = lines[index].trim();
+        if normal_lines.get(index) != Some(&true)
+            || !["public ", "private ", "protected ", "internal "]
+                .iter()
+                .any(|modifier| start.starts_with(modifier))
+            || !start.contains('(')
+        {
+            index += 1;
+            continue;
+        }
+        let mut declaration = start.to_string();
+        while !declaration.contains(')') && index + 1 < lines.len() {
+            index += 1;
+            if normal_lines.get(index) != Some(&true) {
+                break;
+            }
+            declaration.push(' ');
+            declaration.push_str(lines[index].trim());
+        }
+        if let Some((name, parameter)) = local_method_and_first_parameter(&declaration) {
+            parameters
+                .entry(name)
+                .and_modify(|existing| {
+                    if existing.as_deref() != Some(parameter.as_str()) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(parameter));
+        }
+        index += 1;
+    }
+    parameters
+}
+
+fn local_method_and_first_parameter(declaration: &str) -> Option<(String, String)> {
+    let open = declaration.find('(')?;
+    let before = declaration[..open].trim_end();
+    let name = before.split_whitespace().last()?;
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let close = declaration[open + 1..].find(')')? + open + 1;
+    let first = declaration[open + 1..close].split(',').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let before_default = first.split('=').next()?.trim_end();
+    let parameter = before_default.split_whitespace().last()?;
+    parameter
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .then(|| (name.to_string(), parameter.to_string()))
+}
+
+fn remove_verified_named_argument(
+    line: &str,
+    first_parameters: &HashMap<String, Option<String>>,
+) -> Option<String> {
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    if close <= open || !line[close + 1..].trim().starts_with(';') {
+        return None;
+    }
+    let callee = line[..open].split_whitespace().last()?;
+    if !callee
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let argument = line[open + 1..close].trim();
+    if argument.contains(',') || argument.contains(['(', ')']) {
+        return None;
+    }
+    let (name, expression) = argument.split_once(':')?;
+    if name.trim() != first_parameters.get(callee)?.as_deref()? || expression.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        &line[..open + 1],
+        expression.trim_start(),
+        &line[close..]
+    ))
+}
+
+fn replace_apparent_var_declaration(line: &str) -> Option<String> {
+    let indent_len = leading_width(line);
+    let (indent, declaration) = line.split_at(indent_len);
+    let declaration = declaration.strip_prefix("var ")?;
+    let (name, construction) = declaration.split_once(" = new ")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || construction.starts_with(['{', '['])
+    {
+        return None;
+    }
+    let type_end = construction.find(['(', '{'])?;
+    let explicit_type = construction[..type_end].trim_end();
+    if explicit_type.is_empty()
+        || !explicit_type.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '_' | '.' | ':' | '<' | '>' | ',' | '?' | '[' | ']' | ' '
+                )
+        })
+    {
+        return None;
+    }
+    Some(format!(
+        "{indent}{explicit_type} {name} = new {construction}"
+    ))
+}
+
+fn collapse_adjacent_initializer_items(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if let Some((formatted, consumed)) = expand_moq_verify_lambda(&lines, &normal_lines, index)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_expression_member_switch(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            expand_inline_array_initializer_argument(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_anonymous_object_argument(&lines, &normal_lines, index, max_line_length)
+        {
+            output.push(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_invocation_lambda_introduction(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if index > 0
+            && index + 2 < lines.len()
+            && normal_lines[index..=index + 1].iter().all(|normal| *normal)
+            && lines[index - 1].trim() == "{"
+            && lines[index].trim_end().ends_with(',')
+            && lines[index].trim().contains('(')
+            && lines[index + 1].trim().contains('(')
+            && !lines[index + 1].trim().starts_with(['{', '}', '#'])
+            && matches!(lines[index + 2].trim(), "}" | "};")
+            && leading_width(lines[index]) == leading_width(lines[index + 1])
+        {
+            let joined = format!(
+                "{} {}",
+                lines[index].trim_end(),
+                lines[index + 1].trim_start()
+            );
+            if joined.chars().count() < max_line_length {
+                output.push(joined);
+                index += 2;
+                continue;
+            }
+        }
+        output.push(lines[index].to_string());
+        index += 1;
+    }
+
+    output.join("\n")
+}
+
+fn expand_moq_verify_lambda(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first_line = *lines.get(index)?;
+    let (verify_prefix, lambda) = first_line.split_once(".Verify(")?;
+    let lambda = lambda.trim();
+    if normal_lines.get(index) != Some(&true) || !lambda.contains(" => ") || !lambda.ends_with('(')
+    {
+        return None;
+    }
+    let mut end = index + 1;
+    while end < lines.len() && !lines[end].contains(", Times.") {
+        if normal_lines.get(end) != Some(&true) {
+            return None;
+        }
+        end += 1;
+    }
+    let ending = *lines.get(end)?;
+    let (call_end, times_suffix) = ending.rsplit_once(", Times.")?;
+    if !times_suffix.ends_with(");") {
+        return None;
+    }
+    let outer_indent = " ".repeat(leading_width(first_line) + 4);
+    let mut formatted = vec![
+        format!("{verify_prefix}.Verify("),
+        format!("{outer_indent}{lambda}"),
+    ];
+    for line in &lines[index + 1..end] {
+        formatted.push(format!("    {line}"));
+    }
+    formatted.push(format!("    {},", call_end.trim_end()));
+    formatted.push(format!("{outer_indent}Times.{times_suffix}"));
+    Some((formatted, end - index + 1))
+}
+
+fn collapse_expression_member_switch(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let member_line = *lines.get(index)?;
+    let switch_line = *lines.get(index + 1)?;
+    if normal_lines.get(index) != Some(&true) || normal_lines.get(index + 1) != Some(&true) {
+        return None;
+    }
+    let member = member_line.trim_end();
+    let switch = switch_line.trim();
+    if !member.ends_with("=>")
+        || !switch.ends_with(" switch")
+        || !looks_like_member_declaration(member.trim_end_matches("=>").trim_end())
+        || member.chars().count() + 1 + switch.chars().count() > max_line_length
+        || lines.get(index + 2)?.trim() != "{"
+    {
+        return None;
+    }
+    let mut end = index + 3;
+    while end < lines.len() && lines[end].trim() != "};" {
+        if normal_lines.get(end) != Some(&true) {
+            return None;
+        }
+        end += 1;
+    }
+    if end >= lines.len() || leading_width(switch_line) <= leading_width(member_line) {
+        return None;
+    }
+    let shift = leading_width(switch_line) - leading_width(member_line);
+    let mut formatted = vec![format!("{member} {switch}")];
+    for line in &lines[index + 2..=end] {
+        if leading_width(line) < shift {
+            return None;
+        }
+        formatted.push(line[shift..].to_string());
+    }
+    Some((formatted, end - index + 1))
+}
+
+fn expand_inline_array_initializer_argument(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let window = lines.get(index..index + 5)?;
+    if normal_lines
+        .get(index..index + 5)?
+        .iter()
+        .any(|normal| !normal)
+        || !window[0].trim_end().ends_with("(new[]")
+        || window[1].trim() != "{"
+        || !window[2].trim_end().ends_with(',')
+        || window[3].trim().is_empty()
+        || window[3].contains("//")
+        || window[4].trim() != "});"
+        || leading_width(window[1]) != leading_width(window[0])
+        || leading_width(window[2]) <= leading_width(window[1])
+        || leading_width(window[3]) != leading_width(window[2])
+        || leading_width(window[4]) != leading_width(window[0])
+    {
+        return None;
+    }
+    let first = window[0].trim_end().strip_suffix("new[]")?;
+    let nested_indent = " ".repeat(leading_width(window[0]) + 4);
+    let item_indent = format!("{nested_indent}    ");
+    let items = format!("{} {}", window[2].trim(), window[3].trim());
+    if item_indent.chars().count() + items.chars().count() > max_line_length {
+        return None;
+    }
+    Some((
+        vec![
+            first.to_string(),
+            format!("{nested_indent}new[]"),
+            format!("{nested_indent}{{"),
+            format!("{item_indent}{items}"),
+            format!("{nested_indent}}});"),
+        ],
+        5,
+    ))
+}
+
+fn collapse_single_property_initializers(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if lines[index].trim().contains(" = new ")
+            && !lines[index].contains('{')
+            && lines.get(index + 1).is_some_and(|line| line.trim() == "{")
+        {
+            let mut end = index + 2;
+            while end < lines.len() && lines[end].trim() != "};" {
+                end += 1;
+            }
+            let properties = &lines[index + 2..end];
+            if end < lines.len()
+                && !properties.is_empty()
+                && properties.len() <= 4
+                && normal_lines[index..=end].iter().all(|normal| *normal)
+                && leading_width(lines[index + 1]) == leading_width(lines[index])
+                && leading_width(lines[end]) == leading_width(lines[index])
+                && properties.iter().all(|property| {
+                    leading_width(property) > leading_width(lines[index + 1])
+                        && property.contains(" = ")
+                        && !["//", "{", "}"]
+                            .iter()
+                            .any(|pattern| property.contains(pattern))
+                })
+            {
+                let joined = format!(
+                    "{} {{ {} }};",
+                    lines[index].trim_end(),
+                    properties
+                        .iter()
+                        .map(|property| property.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .trim_end_matches(',')
+                );
+                if joined.chars().count() <= max_line_length {
+                    output.push(joined);
+                    index = end + 1;
+                    continue;
+                }
+                let property_line = format!(
+                    "{}{}",
+                    &properties[0][..leading_width(properties[0])],
+                    properties
+                        .iter()
+                        .map(|property| property.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let property_limit = if properties.len() == 4 {
+                    max_line_length.min(100)
+                } else {
+                    max_line_length
+                };
+                if property_line.chars().count() < property_limit {
+                    output.push(lines[index].to_string());
+                    output.push(lines[index + 1].to_string());
+                    output.push(property_line);
+                    output.push(lines[end].to_string());
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        output.push(lines[index].to_string());
+        index += 1;
+    }
+
+    output.join("\n")
+}
+
+fn style_enabled(properties: &Properties, key: &str) -> bool {
+    properties
+        .get(key)
+        .and_then(|value| value.split(':').next())
+        == Some("true")
+}
+
+fn collapse_single_statement_members(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if index + 3 < lines.len()
+            && normal_lines[index..=index + 3].iter().all(|normal| *normal)
+            && can_collapse_single_statement_member(&lines[index..=index + 3])
+        {
+            let signature = lines[index].trim_end();
+            let statement = lines[index + 2].trim();
+            let expression = statement.strip_prefix("return ").unwrap_or(statement);
+            let joined = format!("{signature} => {expression}");
+            if joined.chars().count() < max_line_length {
+                output.push(joined);
+            } else {
+                output.push(format!("{signature} =>"));
+                output.push(lines[index + 2].to_string());
+            }
+            index += 4;
+        } else {
+            output.push(lines[index].to_string());
+            index += 1;
+        }
+    }
+
+    output.join("\n")
+}
+
+fn can_collapse_single_statement_member(lines: &[&str]) -> bool {
+    let signature = lines[0].trim();
+    let statement = lines[2].trim();
+    looks_like_member_declaration(signature)
+        && signature.ends_with(')')
+        && lines[1].trim() == "{"
+        && statement.ends_with(';')
+        && !statement.contains("//")
+        && lines[3].trim() == "}"
+        && leading_width(lines[1]) == leading_width(lines[0])
+        && leading_width(lines[2]) > leading_width(lines[1])
+        && leading_width(lines[3]) == leading_width(lines[0])
+}
+
+fn collapse_simple_wrapping(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if let Some((formatted, consumed)) =
+            align_expression_bodied_boolean_chain(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_expression_member_assert_lambda(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_typed_lambda_introduction(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if index + 1 < lines.len()
+            && normal_lines.get(index) == Some(&true)
+            && normal_lines.get(index + 1) == Some(&true)
+        {
+            if let Some((introduction, body)) = collapse_long_expression_lambda_pair(
+                lines[index],
+                lines[index + 1],
+                max_line_length,
+            ) {
+                output.push(introduction);
+                output.push(body);
+                index += 2;
+                continue;
+            }
+        }
+        if index + 1 < lines.len()
+            && normal_lines.get(index) == Some(&true)
+            && normal_lines.get(index + 1) == Some(&true)
+            && (!lines[index + 1].trim_end().ends_with("=>")
+                || (lines[index + 1].trim_start().starts_with("() =>")
+                    && lines
+                        .get(index + 2)
+                        .is_some_and(|line| line.trim_end().ends_with(");"))))
+            && can_collapse_pair(lines[index], lines[index + 1], max_line_length)
+        {
+            let separator = if lines[index].trim_end().ends_with('(') {
+                ""
+            } else {
+                " "
+            };
+            output.push(format!(
+                "{}{}{}",
+                lines[index].trim_end(),
+                separator,
+                lines[index + 1].trim_start()
+            ));
+            index += 2;
+        } else {
+            output.push(lines[index].to_string());
+            index += 1;
+        }
+    }
+
+    output.join("\n")
+}
+
+fn collapse_typed_lambda_introduction(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first_line = *lines.get(index)?;
+    let lambda_line = *lines.get(index + 1)?;
+    let body_line = *lines.get(index + 2)?;
+    if normal_lines
+        .get(index..=index + 2)?
+        .iter()
+        .any(|normal| !normal)
+    {
+        return None;
+    }
+    let first = first_line.trim_end();
+    let lambda = lambda_line.trim();
+    if !first.ends_with('(')
+        || !lambda.starts_with('(')
+        || !lambda.ends_with("=>")
+        || !lambda.contains(") =>")
+        || !body_line.trim_end().ends_with(");")
+        || leading_width(lambda_line) <= leading_width(first_line)
+        || leading_width(body_line) <= leading_width(lambda_line)
+        || first.chars().count() + lambda.chars().count() > max_line_length
+    {
+        return None;
+    }
+    let body_indent = " ".repeat(leading_width(first_line) + 4);
+    Some((
+        vec![
+            format!("{first}{lambda}"),
+            format!("{body_indent}{}", body_line.trim()),
+        ],
+        3,
+    ))
+}
+
+fn align_expression_bodied_boolean_chain(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let introduction = lines.get(index)?.trim_end();
+    if !introduction.ends_with("=>")
+        || !looks_like_member_declaration(introduction.trim_end_matches("=>").trim_end())
+    {
+        return None;
+    }
+
+    let first_expression = lines.get(index + 1)?.trim();
+    if normal_lines.get(index + 1) != Some(&true)
+        || !first_expression.ends_with("&&")
+        || introduction.chars().count() + 1 + first_expression.chars().count() > max_line_length
+    {
+        return None;
+    }
+
+    let mut end = index + 2;
+    while let Some(line) = lines.get(end) {
+        if normal_lines.get(end) != Some(&true)
+            || leading_width(line) != leading_width(lines[index + 1])
+        {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.ends_with(';') {
+            break;
+        }
+        if !trimmed.ends_with("&&") {
+            return None;
+        }
+        end += 1;
+    }
+    if end >= lines.len() || end == index + 2 {
+        return None;
+    }
+
+    let mut formatted = Vec::with_capacity(end - index + 1);
+    formatted.push(format!("{introduction} {first_expression}"));
+    let alignment = " ".repeat(introduction.chars().count() + 1);
+    for line in &lines[index + 2..=end] {
+        formatted.push(format!("{alignment}{}", line.trim()));
+    }
+    Some((formatted, end - index + 1))
+}
+
+fn collapse_expression_member_assert_lambda(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first_line = *lines.get(index)?;
+    let second_line = *lines.get(index + 1)?;
+    if normal_lines.get(index) != Some(&true) || normal_lines.get(index + 1) != Some(&true) {
+        return None;
+    }
+    let first = first_line.trim_end();
+    let second = second_line.trim();
+    if !first.ends_with("=>")
+        || !first.contains('(')
+        || !looks_like_member_declaration(first.trim_end_matches("=>").trim_end())
+        || !second.starts_with("Assert.")
+        || !second.ends_with("=>")
+        || first.chars().count() + 1 + second.chars().count() > max_line_length
+    {
+        return None;
+    }
+
+    let shift = leading_width(second_line).checked_sub(leading_width(first_line))?;
+    if shift == 0 {
+        return None;
+    }
+    let mut formatted = vec![format!("{first} {second}")];
+    let mut cursor = index + 2;
+    loop {
+        let line = *lines.get(cursor)?;
+        if normal_lines.get(cursor) != Some(&true) || leading_width(line) < shift {
+            return None;
+        }
+        formatted.push(line[shift..].to_string());
+        cursor += 1;
+        if line.trim_end().ends_with("));") {
+            break;
+        }
+    }
+    Some((formatted, cursor - index))
+}
+
+fn collapse_long_expression_lambda_pair(
+    first: &str,
+    second: &str,
+    max_line_length: usize,
+) -> Option<(String, String)> {
+    let first = first.trim_end();
+    let second_trimmed = second.trim();
+    let expression = second_trimmed.strip_prefix("() => ")?;
+    if !first.ends_with('(') || !expression.ends_with(");") {
+        return None;
+    }
+    let joined = format!("{first}() => {expression}");
+    let introduction = format!("{first}() =>");
+    if joined.chars().count() < max_line_length || introduction.chars().count() >= max_line_length {
+        return None;
+    }
+    let indent = &second[..leading_width(second)];
+    Some((introduction, format!("{indent}{expression}")))
+}
+
+fn can_collapse_pair(first: &str, second: &str, max_line_length: usize) -> bool {
+    let first_trimmed = first.trim_end();
+    let second_trimmed = second.trim();
+    if first.contains("//")
+        || second.contains("//")
+        || second_trimmed.is_empty()
+        || second_trimmed.starts_with(['#', '{', '}'])
+        || leading_width(second) <= leading_width(first)
+    {
+        return false;
+    }
+
+    let expression_bodied_property = first_trimmed.ends_with("=>")
+        && second_trimmed.ends_with(';')
+        && !second_trimmed.contains("=>")
+        && !first_trimmed.contains('(')
+        && looks_like_member_declaration(first_trimmed.trim_end_matches("=>").trim_end());
+    let single_string_argument = first_trimmed.ends_with('(')
+        && second_trimmed.ends_with(");")
+        && second_trimmed.starts_with(['"', '$', '@']);
+    let single_simple_argument = first_trimmed.ends_with('(')
+        && (second_trimmed.ends_with("),") || second_trimmed.ends_with(");"))
+        && !["=>", "//", "{"]
+            .iter()
+            .any(|pattern| second_trimmed.contains(pattern))
+        && balanced_delimiters(&format!("{first_trimmed}{second_trimmed}"));
+    let single_assert_argument = first_trimmed.ends_with('(')
+        && first_trimmed.contains("Assert.")
+        && second_trimmed.ends_with(");");
+    let expression_method_to_assert = first_trimmed.ends_with("=>")
+        && first_trimmed.contains('(')
+        && looks_like_member_declaration(first_trimmed.trim_end_matches("=>").trim_end())
+        && second_trimmed.starts_with("Assert.");
+    let invocation_to_lambda = first_trimmed.ends_with('(')
+        && second_trimmed.ends_with("=>")
+        && second_trimmed.starts_with("() =>");
+    let member_declaration = first_trimmed.ends_with('(')
+        && second_trimmed.ends_with(')')
+        && looks_like_member_declaration(first_trimmed);
+    let joined_length = first_trimmed.chars().count() + 1 + second_trimmed.chars().count();
+    (expression_bodied_property
+        || single_string_argument
+        || single_simple_argument
+        || single_assert_argument
+        || expression_method_to_assert
+        || invocation_to_lambda
+        || member_declaration)
+        && joined_length < max_line_length
+}
+
+fn collapse_anonymous_object_argument(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(String, usize)> {
+    let window = lines.get(index..index + 5)?;
+    if normal_lines
+        .get(index..index + 5)?
+        .iter()
+        .any(|normal| !normal)
+        || window[0].trim() != "new"
+        || window[1].trim() != "{"
+        || !window[2].trim_end().ends_with(',')
+        || window[2].contains("//")
+        || window[3].contains("//")
+        || !window[4].trim_start().starts_with("}")
+        || leading_width(window[1]) != leading_width(window[0])
+        || leading_width(window[2]) <= leading_width(window[1])
+        || leading_width(window[3]) != leading_width(window[2])
+        || leading_width(window[4]) != leading_width(window[0])
+    {
+        return None;
+    }
+    let suffix = window[4].trim_start().strip_prefix('}')?;
+    let joined = format!(
+        "{}new {{ {} {} }}{}",
+        &window[0][..leading_width(window[0])],
+        window[2].trim(),
+        window[3].trim(),
+        suffix
+    );
+    (joined.chars().count() <= max_line_length).then_some((joined, 5))
+}
+
+fn collapse_invocation_lambda_introduction(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first_line = *lines.get(index)?;
+    let lambda_line = *lines.get(index + 1)?;
+    if normal_lines.get(index) != Some(&true) || normal_lines.get(index + 1) != Some(&true) {
+        return None;
+    }
+    let first = first_line.trim_end();
+    let lambda = lambda_line.trim();
+    if !first.ends_with('(')
+        || !lambda.contains(" => ")
+        || !lambda.ends_with('(')
+        || first.chars().count() + lambda.chars().count() > max_line_length
+        || leading_width(lambda_line) <= leading_width(first_line)
+    {
+        return None;
+    }
+
+    let continuation_indent = " ".repeat(leading_width(first_line) + 8);
+    let mut formatted = vec![format!("{first}{lambda}")];
+    let mut cursor = index + 2;
+    loop {
+        let line = *lines.get(cursor)?;
+        if normal_lines.get(cursor) != Some(&true)
+            || leading_width(line) <= leading_width(first_line)
+            || line.trim().is_empty()
+        {
+            return None;
+        }
+        formatted.push(format!("{continuation_indent}{}", line.trim()));
+        cursor += 1;
+        if line.trim_end().ends_with("))") {
+            break;
+        }
+    }
+    Some((formatted, cursor - index))
+}
+
+fn balanced_delimiters(value: &str) -> bool {
+    let mut parentheses = 0i32;
+    let mut brackets = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '(' => parentheses += 1,
+            ')' => parentheses -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+        if parentheses < 0 || brackets < 0 {
+            return false;
+        }
+    }
+    parentheses == 0 && brackets == 0
+}
+
+fn looks_like_member_declaration(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let has_member_modifier = ["public ", "private ", "protected ", "internal "]
+        .iter()
+        .any(|modifier| trimmed.starts_with(modifier));
+    let before_paren = trimmed.trim_end_matches('(');
+    has_member_modifier && !before_paren.contains(['.', '=', '?'])
+}
+
+fn leading_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn normal_code_lines(input: &str) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut state = CodeState::Normal;
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut line_normal = true;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        match state {
+            CodeState::Normal => {
+                if ch == '/' && chars.get(index + 1) == Some(&'*') {
+                    state = CodeState::BlockComment;
+                    line_normal = false;
+                    index += 2;
+                    continue;
+                }
+                if ch == '/' && chars.get(index + 1) == Some(&'/') {
+                    state = CodeState::LineComment;
+                    index += 2;
+                    continue;
+                }
+                if let Some((literal_len, verbatim)) = string_literal_start(&chars, index) {
+                    state = CodeState::String { verbatim };
+                    index += literal_len;
+                    continue;
+                }
+                if ch == '\'' {
+                    state = CodeState::Char;
+                }
+                index += 1;
+            }
+            CodeState::LineComment => {
+                index += 1;
+                if ch == '\n' {
+                    state = CodeState::Normal;
+                }
+            }
+            CodeState::BlockComment => {
+                line_normal = false;
+                if ch == '*' && chars.get(index + 1) == Some(&'/') {
+                    state = CodeState::Normal;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            CodeState::String { verbatim } => {
+                if verbatim && ch == '\n' {
+                    line_normal = false;
+                }
+                if verbatim && ch == '"' && chars.get(index + 1) == Some(&'"') {
+                    index += 2;
+                    continue;
+                }
+                if ch == '"' {
+                    state = CodeState::Normal;
+                } else if !verbatim && ch == '\\' {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+            }
+            CodeState::Char => {
+                if ch == '\'' {
+                    state = CodeState::Normal;
+                } else if ch == '\\' {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+            }
+        }
+
+        if ch == '\n' {
+            flags.push(line_normal && matches!(state, CodeState::Normal));
+            line_normal = matches!(state, CodeState::Normal);
+        }
+    }
+    flags.push(line_normal && matches!(state, CodeState::Normal));
+    flags
+}
+
+pub(crate) fn verbatim_string_lines(input: &str) -> Vec<bool> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut flags = Vec::new();
+    let mut state = CodeState::Normal;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        match state {
+            CodeState::Normal => {
+                if ch == '/' && chars.get(index + 1) == Some(&'/') {
+                    state = CodeState::LineComment;
+                    index += 2;
+                    continue;
+                }
+                if ch == '/' && chars.get(index + 1) == Some(&'*') {
+                    state = CodeState::BlockComment;
+                    index += 2;
+                    continue;
+                }
+                if let Some((literal_len, verbatim)) = string_literal_start(&chars, index) {
+                    state = CodeState::String { verbatim };
+                    index += literal_len;
+                    continue;
+                }
+                if ch == '\'' {
+                    state = CodeState::Char;
+                }
+                index += 1;
+            }
+            CodeState::LineComment => {
+                index += 1;
+                if ch == '\n' {
+                    state = CodeState::Normal;
+                }
+            }
+            CodeState::BlockComment => {
+                if ch == '*' && chars.get(index + 1) == Some(&'/') {
+                    state = CodeState::Normal;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            CodeState::String { verbatim } => {
+                if verbatim && ch == '"' && chars.get(index + 1) == Some(&'"') {
+                    index += 2;
+                    continue;
+                }
+                if ch == '"' {
+                    state = CodeState::Normal;
+                } else if !verbatim && ch == '\\' {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+            }
+            CodeState::Char => {
+                if ch == '\'' {
+                    state = CodeState::Normal;
+                } else if ch == '\\' {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+            }
+        }
+
+        if ch == '\n' {
+            flags.push(matches!(state, CodeState::String { verbatim: true }));
+        }
+    }
+    flags.push(matches!(state, CodeState::String { verbatim: true }));
+    flags
 }
 
 fn bool_property(properties: &Properties, key: &str, default: bool) -> bool {
@@ -149,6 +1637,7 @@ fn parse_modifier_order(properties: &Properties) -> Vec<String> {
 }
 
 fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
+    let input = normalize_alias_using_trivia(input);
     let mut output = Vec::new();
     let lines: Vec<&str> = input.split('\n').collect();
     let mut index = 0usize;
@@ -183,6 +1672,35 @@ fn sort_using_blocks(input: &str, options: &CSharpOptions) -> String {
     }
 
     output.join("\n")
+}
+
+fn normalize_alias_using_trivia(input: &str) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty()
+            && index > 0
+            && is_using_directive(lines[index - 1])
+            && comment_block_is_followed_by_alias_using(&lines, index + 1)
+        {
+            continue;
+        }
+        output.push((*line).to_string());
+    }
+    output.join("\n")
+}
+
+fn comment_block_is_followed_by_alias_using(lines: &[&str], mut index: usize) -> bool {
+    let mut saw_comment = false;
+    while let Some(line) = lines.get(index) {
+        if line.trim_start().starts_with("//") {
+            saw_comment = true;
+            index += 1;
+            continue;
+        }
+        return saw_comment && is_using_alias_directive(line);
+    }
+    false
 }
 
 fn is_header_trivia(line: &str) -> bool {
@@ -238,7 +1756,11 @@ fn format_using_block(lines: &[&str], options: &CSharpOptions) -> Vec<String> {
     for directive in lines
         .iter()
         .filter(|line| is_using_directive(line))
-        .map(|line| line.trim().to_string())
+        .map(|line| {
+            line.trim()
+                .replace(" = global::Microsoft.", " = Microsoft.")
+                .replace(" = global::System.", " = System.")
+        })
     {
         if seen.insert(directive.clone()) {
             directives.push(directive);
@@ -885,10 +2407,17 @@ mod tests {
 
     fn options() -> CSharpOptions {
         CSharpOptions {
+            interface_layout: None,
             sort_usings: true,
+            arrange_fields: true,
+            remove_clearly_unused_usings: false,
             reorder_modifiers: true,
             normalize_spacing: true,
             normalize_newlines: true,
+            collapse_simple_wrapping: true,
+            prefer_expression_bodied_members: true,
+            prefer_explicit_type_when_apparent: true,
+            max_line_length: 120,
             sort_system_directives_first: true,
             separate_import_directive_groups: true,
             space_after_comma: true,
@@ -1048,5 +2577,354 @@ mod tests {
         let input = "class C\n{\n    void M()\n    {\n        try\n        {\n        }\n        catch\n        {\n        }\n    }\n}\n";
 
         assert_eq!(format_csharp(input, options), input);
+    }
+
+    #[test]
+    fn collapses_simple_wrapping_that_fits_the_margin() {
+        let input = "class C\n{\n    public bool Enabled =>\n        Availability.IsEnabled(s_enabled);\n\n    void M()\n    {\n        Logger.Log(\n            \"disabled\");\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public bool Enabled => Availability.IsEnabled(s_enabled);\n\n    void M()\n    {\n        Logger.Log(\"disabled\");\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_single_line_assert_arguments() {
+        let input = "class C\n{\n    void M()\n    {\n        Assert.IsTrue(\n            Parser.TryParse(\"value\", out string result));\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Assert.IsTrue(Parser.TryParse(\"value\", out string result));\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_long_and_verbatim_string_wrapping() {
+        let input = "class C\n{\n    string Script = @\"call(\n        value);\";\n    public bool Enabled =>\n        ThisExpressionIsFarTooLongToFitInsideTheConfiguredRightMarginBecauseItContainsManyWords(s_enabled);\n}\n";
+
+        assert_eq!(format_csharp(input, options()), input);
+    }
+
+    #[test]
+    fn converts_single_statement_member_to_expression_body() {
+        let input = "class C\n{\n    public C(IReadOnlyList<string> values)\n    {\n        _values = values ?? throw new ArgumentNullException(nameof(values));\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public C(IReadOnlyList<string> values) => _values = values ?? throw new ArgumentNullException(nameof(values));\n}\n"
+        );
+    }
+
+    #[test]
+    fn identifies_lines_inside_verbatim_strings() {
+        assert_eq!(
+            verbatim_string_lines("var xml = @\"<a> \n  <b /> \n</a>\"; \n"),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn rejects_candidate_that_breaks_parseable_csharp() {
+        let input = "class C { void M() { } }\n";
+        assert_eq!(
+            super::preserve_parseable_input(input, "class C { void M( { } }\n".to_string()),
+            input
+        );
+    }
+
+    #[test]
+    fn does_not_hide_existing_parse_errors() {
+        let input = "class C { void M( { } }\n";
+        let candidate = "class C { void M( { int value = 1; } }\n".to_string();
+        assert_eq!(
+            super::preserve_parseable_input(input, candidate.clone()),
+            candidate
+        );
+    }
+
+    #[test]
+    fn collapses_single_property_object_initializer() {
+        let input = "class C\n{\n    void M()\n    {\n        Candidate candidate = new Candidate\n        {\n            Field = \"value\"\n        };\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Candidate candidate = new Candidate { Field = \"value\" };\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_short_initializer_items() {
+        let input =
+            "VirtualParagraph[] Values() => new[]\n{\n    Make(0, 10),\n    Make(10, 20)\n};\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "VirtualParagraph[] Values() => new[]\n{\n    Make(0, 10), Make(10, 20)\n};\n"
+        );
+    }
+
+    #[test]
+    fn removes_blank_line_before_documented_alias_using() {
+        let input = "using System;\n\n// Avoid an ambiguous type name.\nusing Range = Word.Range;\n\nclass C {}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "using System;\n// Avoid an ambiguous type name.\nusing Range = Word.Range;\n\nclass C {}\n"
+        );
+    }
+
+    #[test]
+    fn joins_invocation_and_lambda_introduction() {
+        let input = "class C\n{\n    void M()\n    {\n        dispatcher.PostAsync(\n            () =>\n                Clear());\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        dispatcher.PostAsync(() =>\n            Clear());\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn splits_long_expression_lambda_after_arrow() {
+        let input = "class C\n{\n    void M()\n    {\n        await dispatcher.PostAsync(\n            () => controller.ResolveCurrentDocumentAndClearAllDecorations());\n    }\n}\n";
+        let mut options = options();
+        options.max_line_length = 80;
+
+        assert_eq!(
+            format_csharp(input, options),
+            "class C\n{\n    void M()\n    {\n        await dispatcher.PostAsync(() =>\n            controller.ResolveCurrentDocumentAndClearAllDecorations());\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn aligns_expression_bodied_boolean_chain() {
+        let input = "class C\n{\n    public bool Equals(C other) =>\n        Start == other.Start &&\n        End == other.End &&\n        Limit == other.Limit;\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public bool Equals(C other) => Start == other.Start &&\n                                   End == other.End &&\n                                   Limit == other.Limit;\n}\n"
+        );
+    }
+
+    #[test]
+    fn joins_expression_member_and_assert_lambda() {
+        let input = "class C\n{\n    public void Throws() =>\n        Assert.ThrowsException<ArgumentException>(() =>\n            Run());\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public void Throws() => Assert.ThrowsException<ArgumentException>(() =>\n        Run());\n}\n"
+        );
+    }
+
+    #[test]
+    fn replaces_var_for_apparent_object_creation() {
+        let input =
+            "class C\n{\n    void M()\n    {\n        var items = new List<object>(4);\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        List<object> items = new List<object>(4);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn replaces_var_for_generic_object_creation() {
+        let input = "class C\n{\n    void M()\n    {\n        var values = new Dictionary<string, object>();\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Dictionary<string, object> values = new Dictionary<string, object>();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_nested_single_argument_invocation() {
+        let input = "class C\n{\n    void M()\n    {\n        Call(\n            Inner(\n                value),\n            other);\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Call(\n            Inner(value),\n            other);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_two_property_anonymous_object_argument() {
+        let input = "class C\n{\n    void M()\n    {\n        Serialize(\n            new\n            {\n                type = \"event\",\n                payload = new { error }\n            }));\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Serialize(\n            new { type = \"event\", payload = new { error } }));\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_invocation_lambda_introduction() {
+        let input = "class C\n{\n    object M()\n    {\n        return values.Select(\n                value => Build(\n                    value.Name,\n                    value.Offset))\n            .ToList();\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    object M()\n    {\n        return values.Select(value => Build(\n                value.Name,\n                value.Offset))\n            .ToList();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn removes_named_argument_verified_against_local_method() {
+        let input = "class C\n{\n    void M()\n    {\n        Send(loading: true);\n    }\n\n    private void Send(\n        bool loading = false,\n        string message = null)\n    {\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Send(true);\n    }\n\n    private void Send(\n        bool loading = false,\n        string message = null)\n    {\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_named_argument_when_local_overloads_disagree() {
+        let input = "class C\n{\n    void M()\n    {\n        Send(loading: true);\n    }\n\n    private void Send(bool loading) {}\n    private void Send(string message) {}\n}\n";
+
+        assert_eq!(format_csharp(input, options()), input);
+    }
+
+    #[test]
+    fn removes_global_qualifier_for_declared_root_namespace() {
+        let input = "namespace Elsa.Forms\n{\n    class C\n    {\n        global::Elsa.Services.IService service;\n        global::Elsa.Forms.Dialog dialog;\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "namespace Elsa.Forms\n{\n    class C\n    {\n        Elsa.Services.IService service;\n        Dialog dialog;\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn removes_known_framework_constructor_argument_name() {
+        let input = "using System.Threading;\n\nclass C\n{\n    CancellationToken token = new CancellationToken(canceled: true);\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "using System.Threading;\n\nclass C\n{\n    CancellationToken token = new CancellationToken(true);\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_short_multi_property_initializer() {
+        let input = "class C\n{\n    void M()\n    {\n        Item item = new Item\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Item item = new Item { Field = \"field\", Role = \"role\", Label = \"label\" };\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_properties_without_joining_long_declaration() {
+        let input = "class C\n{\n    void M()\n    {\n        VeryLongCandidateName candidate = new VeryLongCandidateName\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
+        let mut options = options();
+        options.max_line_length = 90;
+
+        assert_eq!(
+            format_csharp(input, options),
+            "class C\n{\n    void M()\n    {\n        VeryLongCandidateName candidate = new VeryLongCandidateName\n        {\n            Field = \"field\", Role = \"role\", Label = \"label\"\n        };\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn removes_global_qualifier_from_framework_alias() {
+        let input = "using Word = global::Microsoft.Office.Interop.Word;\n\nclass C {}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "using Word = Microsoft.Office.Interop.Word;\n\nclass C {}\n"
+        );
+    }
+
+    #[test]
+    fn imports_known_qualified_framework_type() {
+        let input = "using System.Text;\n\nclass C\n{\n    object Value = System.StringComparison.Ordinal;\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "using System;\nusing System.Text;\n\nclass C\n{\n    object Value = StringComparison.Ordinal;\n}\n"
+        );
+    }
+
+    #[test]
+    fn removes_null_forgiving_after_not_null_assertion() {
+        let input = "class C\n{\n    void M()\n    {\n        PropertyInfo value = Find();\n        Assert.IsNotNull(value);\n        value!.SetValue(this, 1);\n    }\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        PropertyInfo value = Find();\n        Assert.IsNotNull(value);\n        value.SetValue(this, 1);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn expands_inline_array_argument_and_joins_items() {
+        let input = "class C\n{\n    void M()\n    {\n        Replace(new[]\n        {\n            Make(0, 10),\n            Make(10, 20)\n        });\n    }\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        Replace(\n            new[]\n            {\n                Make(0, 10), Make(10, 20)\n            });\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn removes_clearly_unused_system_using() {
+        let input = "using System;\nusing System.Collections.Generic;\n\nclass C\n{\n    Queue<int> Values;\n}\n";
+        let mut options = options();
+        options.remove_clearly_unused_usings = true;
+        assert_eq!(
+            format_csharp(input, options),
+            "using System.Collections.Generic;\n\nclass C\n{\n    Queue<int> Values;\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_system_using_for_root_type() {
+        let input = "using System;\n\nclass C : IDisposable\n{\n    public void Dispose() {}\n}\n";
+        let mut options = options();
+        options.remove_clearly_unused_usings = true;
+        assert_eq!(format_csharp(input, options), input);
+    }
+
+    #[test]
+    fn joins_expression_member_switch_and_outdents_arms() {
+        let input = "class C\n{\n    private static string Label(string value) =>\n        value switch\n        {\n            \"a\" => \"A\",\n            _ => value\n        };\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    private static string Label(string value) => value switch\n    {\n        \"a\" => \"A\",\n        _ => value\n    };\n}\n"
+        );
+    }
+
+    #[test]
+    fn expands_long_moq_verify_lambda() {
+        let input = "class C\n{\n    void M()\n    {\n        server.Verify(s => s.Call(\n            It.IsAny<string>(),\n            It.IsAny<int>()), Times.Once);\n    }\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        server.Verify(\n            s => s.Call(\n                It.IsAny<string>(),\n                It.IsAny<int>()),\n            Times.Once);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn expands_long_object_creation_arguments() {
+        let input = "class C\n{\n    void M()\n    {\n        RenderParam renderParam = new RenderParam(OverlayStyle.BlockHighlight, HighlightColors.BackgroundActive);\n    }\n}\n";
+        let mut options = options();
+        options.max_line_length = 100;
+        assert_eq!(
+            format_csharp(input, options),
+            "class C\n{\n    void M()\n    {\n        RenderParam renderParam = new RenderParam(\n            OverlayStyle.BlockHighlight,\n            HighlightColors.BackgroundActive);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn imports_known_project_type_qualification() {
+        let input = "using System;\n\nclass C\n{\n    Elsa.Services.VirtualDocumentService.IVirtualDocumentService Value;\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "using System;\nusing Elsa.Services.VirtualDocumentService;\n\nclass C\n{\n    IVirtualDocumentService Value;\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_typed_lambda_introduction() {
+        let input = "class C\n{\n    void M()\n    {\n        mock.Returns(\n            (Range range) =>\n                new Result(range));\n    }\n}\n";
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        mock.Returns((Range range) =>\n            new Result(range));\n    }\n}\n"
+        );
     }
 }

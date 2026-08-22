@@ -18,6 +18,16 @@ impl Properties {
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
     }
+
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            values: pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
