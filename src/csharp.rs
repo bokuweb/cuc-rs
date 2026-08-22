@@ -37,8 +37,11 @@ impl CSharpOptions {
         Self {
             interface_layout: None,
             sort_usings: true,
-            arrange_fields: true,
-            remove_clearly_unused_usings: true,
+            // Both operations need a fully resolved semantic model. Elsa's
+            // authoritative Windows/VSTO cleanup exposed false positives in
+            // the local-name heuristics, so production mode keeps them off.
+            arrange_fields: false,
+            remove_clearly_unused_usings: false,
             reorder_modifiers: false,
             normalize_spacing: true,
             normalize_newlines: true,
@@ -935,8 +938,7 @@ fn collapse_single_property_initializers(input: &str, max_line_length: usize) ->
             }
             let properties = &lines[index + 2..end];
             if end < lines.len()
-                && !properties.is_empty()
-                && properties.len() <= 4
+                && properties.len() == 1
                 && normal_lines[index..=end].iter().all(|normal| *normal)
                 && leading_width(lines[index + 1]) == leading_width(lines[index])
                 && leading_width(lines[end]) == leading_width(lines[index])
@@ -972,12 +974,7 @@ fn collapse_single_property_initializers(input: &str, max_line_length: usize) ->
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
-                let property_limit = if properties.len() == 4 {
-                    max_line_length.min(100)
-                } else {
-                    max_line_length
-                };
-                if property_line.chars().count() < property_limit {
+                if property_line.chars().count() < max_line_length {
                     output.push(lines[index].to_string());
                     output.push(lines[index + 1].to_string());
                     output.push(property_line);
@@ -2455,6 +2452,20 @@ mod tests {
     }
 
     #[test]
+    fn production_options_preserve_layout_without_a_semantic_model() {
+        let properties = Properties::from_pairs(&[(
+            "resharper_keep_existing_invocation_parens_arrangement",
+            "false",
+        )]);
+        let options = CSharpOptions::from_properties(&properties);
+        assert!(!options.arrange_fields);
+        assert!(!options.remove_clearly_unused_usings);
+
+        let input = "using System;\nusing System.Collections.Generic;\n\nclass C\n{\n    [SetUp]\n    public void SetUp() {}\n\n    private object _app;\n\n    void M()\n    {\n        Item item = new Item\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
+        assert_eq!(format_csharp(input, options), input);
+    }
+
+    #[test]
     fn sorts_and_deduplicates_using_blocks() {
         let input = "using Elsa;\nusing System.Text;\nusing System;\nusing Elsa;\n\nclass C {}\n";
 
@@ -2805,25 +2816,19 @@ mod tests {
     }
 
     #[test]
-    fn collapses_short_multi_property_initializer() {
+    fn preserves_short_multi_property_initializer_without_semantic_layout() {
         let input = "class C\n{\n    void M()\n    {\n        Item item = new Item\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
 
-        assert_eq!(
-            format_csharp(input, options()),
-            "class C\n{\n    void M()\n    {\n        Item item = new Item { Field = \"field\", Role = \"role\", Label = \"label\" };\n    }\n}\n"
-        );
+        assert_eq!(format_csharp(input, options()), input);
     }
 
     #[test]
-    fn collapses_properties_without_joining_long_declaration() {
+    fn preserves_multi_property_initializer_with_long_declaration() {
         let input = "class C\n{\n    void M()\n    {\n        VeryLongCandidateName candidate = new VeryLongCandidateName\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
         let mut options = options();
         options.max_line_length = 90;
 
-        assert_eq!(
-            format_csharp(input, options),
-            "class C\n{\n    void M()\n    {\n        VeryLongCandidateName candidate = new VeryLongCandidateName\n        {\n            Field = \"field\", Role = \"role\", Label = \"label\"\n        };\n    }\n}\n"
-        );
+        assert_eq!(format_csharp(input, options), input);
     }
 
     #[test]

@@ -14,6 +14,7 @@ struct InterfaceInfo {
 }
 
 impl InterfaceLayout {
+    #[cfg(test)]
     pub fn from_sources<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
         let mut layout = Self::default();
         for source in sources {
@@ -37,6 +38,7 @@ pub fn parse_csharp(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+#[cfg(test)]
 fn collect_interface_declarations(
     node: tree_sitter::Node<'_>,
     source: &str,

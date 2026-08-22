@@ -7,7 +7,6 @@ mod xaml;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -106,30 +105,6 @@ fn main() -> Result<()> {
     let mut visited = 0usize;
     let mut changed = Vec::new();
     let files = collect_files(&cli.paths)?;
-    let interface_layout = if cli.csharp {
-        let sources = files
-            .iter()
-            .filter(|path| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
-            })
-            .filter_map(|path| fs::read(path).ok())
-            .filter(|bytes| {
-                bytes
-                    .windows(b"interface ".len())
-                    .any(|window| window == b"interface ")
-            })
-            .filter_map(|bytes| decode_utf8(&bytes))
-            .map(|source| source.trim_start_matches(formatter::BOM_MARK).to_string())
-            .collect::<Vec<_>>();
-        Some(Arc::new(syntax::InterfaceLayout::from_sources(
-            sources.iter().map(String::as_str),
-        )))
-    } else {
-        None
-    };
-
     for path in files {
         let Some(relative_path) = pathdiff(&path, &root) else {
             continue;
@@ -167,7 +142,7 @@ fn main() -> Result<()> {
             }
             None => continue,
         };
-        let mut options = FormatOptions::from_properties(
+        let options = FormatOptions::from_properties(
             &properties,
             cli.text,
             cli.indent,
@@ -176,9 +151,6 @@ fn main() -> Result<()> {
             solution_scope,
             &relative_path,
         );
-        if let (Some(csharp), Some(layout)) = (&mut options.csharp, &interface_layout) {
-            csharp.interface_layout = Some(Arc::clone(layout));
-        }
         let output = format_text(&input, options);
         visited += 1;
 

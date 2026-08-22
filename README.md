@@ -26,9 +26,6 @@ Newline-only C# checks are available behind `--csharp-newlines`.
   ReSharper is configured not to preserve the existing arrangement
 - replacement of `var` for simple object creation when the configured style
   prefers an apparent explicit type
-- syntax-tree-guarded relocation of misplaced fields, constructors, nested
-  types, and interface implementation members
-- conservative removal of clearly unused `using System;` directives
 - conservative XAML tag/attribute spacing and continuation alignment, including
   SDK-style WPF projects' implicit `Page` and `ApplicationDefinition` items
 
@@ -36,9 +33,11 @@ Modifier ordering and broad token spacing rewrites are implemented as internal
 experiments but are not enabled in `--csharp` yet. They need a syntax-aware
 implementation before they are safe enough to apply to real C#.
 
-General unused `using` removal is intentionally not implemented yet because it
-needs a semantic model. The enabled pass only removes a small set of usages it
-can prove locally.
+Unused `using` removal and member-layout reordering are intentionally not
+enabled because both require a fully resolved semantic model. Earlier local
+heuristics are retained as testable experiments, but an authoritative
+Windows/VSTO run showed that enabling them could rewrite already-clean Elsa
+sources.
 
 ## Usage
 
@@ -64,13 +63,21 @@ cargo run -- --config ../elsa/.editorconfig --text --csharp \
 The oracle classifies each changed UTF-8 file as `exact`, `partial`, or
 `missed`. It is a regression corpus, not the final authority: a commit can mix
 manual edits with cleanup output, and output can differ between ReSharper
-versions. As of 2026-08-22, the selected Elsa corpus is 35/40 exact, 3 partial,
-and 2 missed. On the current 887-file Elsa solution, a macOS diagnostic run
-matches 29 of the 32 C# bodies changed by ReSharper and all XAML/XML output.
-The three remaining C# differences are tied to unresolved references: one
-ReSharper transformation changes exception behavior, while the other two
-member-order changes disappear in an equivalent fully resolved project. The
-Windows/VSTO result is therefore the authority rather than that macOS output.
+versions. As of 2026-08-22, the safety-first formatter matches 25/40 files in
+the selected historical macOS corpus, with 8 partial and 7 missed. That corpus
+is useful for regression discovery but is not certification: missing VSTO and
+.NET Framework references can make ReSharper remove imports or rearrange
+members differently. Ten former matches were deliberately given up after those
+semantic guesses produced false positives under Windows. The Windows/VSTO
+result is therefore the authority rather than macOS output.
+
+On Elsa `main` at `1645ba170fb91c8bc4488e5e6c1ffda0a2eca9f4`, the existing
+Windows cleanup job (ReSharper 2025.1.2 with restored VSTO/.NET Framework
+references) completed with zero diff. cuc checked the same 1,107 files twice
+with zero diff in 2.18 s and 1.99 s respectively; the Windows cleanup job's
+cleanup step took 15 min 20 s after setup. This proves clean-baseline
+agreement for that revision, not full replacement parity on arbitrary dirty
+inputs.
 
 Replacement readiness requires byte-for-byte agreement with the pinned
 ReSharper version on independently formatted Windows worktrees and two
