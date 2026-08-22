@@ -38,6 +38,14 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
+      - name: Require Elsa repository token
+        shell: pwsh
+        env:
+          ELSA_REPO_TOKEN: ${{ secrets.ELSA_REPO_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ELSA_REPO_TOKEN)) {
+            throw "Missing ELSA_REPO_TOKEN. Add a fine-grained token with read-only Contents access to jlsi/elsa."
+          }
       - uses: actions/checkout@v4
         with:
           path: cuc-rs
@@ -47,6 +55,7 @@ jobs:
           fetch-depth: 0
           path: elsa
           ref: ${{ inputs.elsa_ref }}
+          token: ${{ secrets.ELSA_REPO_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Build cuc
         working-directory: cuc-rs

@@ -96,4 +96,7 @@ Elsa `HEAD`; `-CurrentOnly` is the faster iteration gate.
 The manually triggered `elsa-parity` GitHub Actions job runs the same comparison
 on Windows with the same ReSharper CLI version pinned by Elsa CI (2025.1.2),
 accepts the Elsa ref and current/full scope as inputs, and uploads separate cuc
-and cleanupcode diffs when parity or idempotency fails.
+and cleanupcode diffs when parity or idempotency fails. Because Elsa is private,
+the cuc-rs repository must define an `ELSA_REPO_TOKEN` Actions secret containing
+a fine-grained token with read-only `Contents` access to `jlsi/elsa`; do not use
+a broad personal token.
