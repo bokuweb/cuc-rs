@@ -24,6 +24,7 @@ $ErrorActionPreference = "Stop"
 $elsa = (Resolve-Path $ElsaRepo).Path
 $cuc = (Resolve-Path $CucExe).Path
 $jb = (Get-Command jb -ErrorAction Stop).Source
+$msbuild = (Get-Command MSBuild -ErrorAction Stop).Source
 $hadMismatch = $false
 $targets = @(
     if (-not $CurrentOnly) {
@@ -89,6 +90,9 @@ foreach ($target in $targets) {
 
         Push-Location $resharper
         try {
+            & $msbuild ./Elsa.sln /t:Restore /p:RestoreLockedMode=true
+            if ($LASTEXITCODE -ne 0) { throw "locked-mode restore failed for $label" }
+
             & $jb cleanupcode ./Elsa.sln --config-file=.editorconfig --settings=Elsa.sln.DotSettings --no-build --severity=WARNING '--exclude=**/*.html'
             if ($LASTEXITCODE -ne 0) { throw "cleanupcode failed for $label" }
             $firstReSharperDiff = (& git diff --no-ext-diff --binary -- .) -join "`n"
