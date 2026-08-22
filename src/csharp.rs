@@ -173,6 +173,7 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     };
     let input = if options.collapse_simple_wrapping {
         let input = expand_long_object_creation_arguments(&input, options.max_line_length);
+        let input = collapse_empty_using_blocks(&input, options.max_line_length);
         let input = collapse_single_property_initializers(&input, options.max_line_length);
         let input = collapse_adjacent_initializer_items(&input, options.max_line_length);
         collapse_simple_wrapping(&input, options.max_line_length)
@@ -1029,6 +1030,37 @@ fn collapse_single_statement_members(input: &str, max_line_length: usize) -> Str
     output.join("\n")
 }
 
+fn collapse_empty_using_blocks(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if index + 2 < lines.len()
+            && normal_lines[index..=index + 2].iter().all(|normal| *normal)
+            && lines[index].trim_start().starts_with("using (")
+            && lines[index].trim_end().ends_with(')')
+            && lines[index + 1].trim() == "{"
+            && lines[index + 2].trim() == "}"
+            && leading_width(lines[index + 1]) == leading_width(lines[index])
+            && leading_width(lines[index + 2]) == leading_width(lines[index])
+        {
+            let joined = format!("{} {{ }}", lines[index].trim_end());
+            if joined.chars().count() <= max_line_length {
+                output.push(joined);
+                index += 3;
+                continue;
+            }
+        }
+
+        output.push(lines[index].to_string());
+        index += 1;
+    }
+
+    output.join("\n")
+}
+
 fn can_collapse_single_statement_member(lines: &[&str]) -> bool {
     let signature = lines[0].trim();
     let statement = lines[2].trim();
@@ -1848,9 +1880,17 @@ fn reorder_modifiers(input: &str, options: &CSharpOptions) -> String {
         .map(|(index, modifier)| (modifier.as_str(), index))
         .collect::<HashMap<_, _>>();
 
+    let normal_lines = normal_code_lines(input);
     input
         .split('\n')
-        .map(|line| reorder_modifiers_in_line(line, &rank))
+        .enumerate()
+        .map(|(index, line)| {
+            if normal_lines.get(index) == Some(&true) {
+                reorder_modifiers_in_line(line, &rank)
+            } else {
+                line.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2460,9 +2500,20 @@ mod tests {
         let options = CSharpOptions::from_properties(&properties);
         assert!(!options.arrange_fields);
         assert!(!options.remove_clearly_unused_usings);
+        assert!(!options.reorder_modifiers);
 
         let input = "using System;\nusing System.Collections.Generic;\n\nclass C\n{\n    [SetUp]\n    public void SetUp() {}\n\n    private object _app;\n\n    void M()\n    {\n        Item item = new Item\n        {\n            Field = \"field\",\n            Role = \"role\",\n            Label = \"label\"\n        };\n    }\n}\n";
         assert_eq!(format_csharp(input, options), input);
+    }
+
+    #[test]
+    fn modifier_order_ignores_multiline_comments_and_strings() {
+        let input = "class C\n{\n    readonly public int Value;\n\n    /*\n    readonly public remains documentation\n    */\n\n    private const string Text = @\"\nreadonly public remains text\n\";\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public readonly int Value;\n\n    /*\n    readonly public remains documentation\n    */\n\n    private const string Text = @\"\nreadonly public remains text\n\";\n}\n"
+        );
     }
 
     #[test]
@@ -2597,6 +2648,16 @@ mod tests {
         assert_eq!(
             format_csharp(input, options()),
             "class C\n{\n    public bool Enabled => Availability.IsEnabled(s_enabled);\n\n    void M()\n    {\n        Logger.Log(\"disabled\");\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_empty_using_statement_block() {
+        let input = "class C\n{\n    void M()\n    {\n        using (Acquire())\n        {\n        }\n    }\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    void M()\n    {\n        using (Acquire()) { }\n    }\n}\n"
         );
     }
 
