@@ -14,9 +14,13 @@ struct InterfaceInfo {
 }
 
 impl InterfaceLayout {
-    pub fn from_sources<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
+    pub fn from_sources<S>(sources: impl IntoIterator<Item = S>) -> Self
+    where
+        S: AsRef<str>,
+    {
         let mut layout = Self::default();
         for source in sources {
+            let source = source.as_ref();
             let Some(tree) = parse_csharp(source) else {
                 continue;
             };
@@ -1413,6 +1417,20 @@ mod tests {
         let output = super::arrange_interface_overloads(input, &layout);
         assert_eq!(output, expected);
         assert_eq!(super::arrange_interface_overloads(&output, &layout), output);
+    }
+
+    #[test]
+    fn builds_interface_layout_from_owned_sources() {
+        let sources = vec![
+            "interface IPlugin\n{\n    void Draw(int start);\n}\n".to_string(),
+            "interface IDocumentEndProvider\n{\n    void Draw(int start, int documentEnd);\n}\n"
+                .to_string(),
+        ];
+        let layout = super::InterfaceLayout::from_sources(sources);
+        let input = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public void Draw(int start) {}\n\n    public void Draw(int start, int documentEnd) {}\n}\n";
+        let expected = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public void Draw(int start, int documentEnd) {}\n\n    public void Draw(int start) {}\n}\n";
+
+        assert_eq!(super::arrange_interface_overloads(input, &layout), expected);
     }
 
     #[test]
