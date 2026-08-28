@@ -110,13 +110,11 @@ fn main() -> Result<()> {
     // public overloadをprimary interface実装群の前へ寄せる限定的なlayoutだけを有効化する。
     // 単一ファイル/ディレクトリ指定では宣言が欠け得るので従来どおり並べ替えない。
     let interface_layout = if solution_scope && cli.csharp {
-        let sources = files
-            .iter()
-            .filter(|path| is_csharp_file(path))
-            .filter_map(|path| fs::read_to_string(path).ok())
-            .collect::<Vec<_>>();
         Some(Arc::new(crate::syntax::InterfaceLayout::from_sources(
-            sources.iter().map(String::as_str),
+            files
+                .iter()
+                .filter(|path| is_csharp_file(path))
+                .filter_map(|path| fs::read_to_string(path).ok()),
         )))
     } else {
         None
