@@ -7,6 +7,7 @@ use crate::editorconfig::Properties;
 #[allow(dead_code)]
 pub struct CSharpOptions {
     pub interface_layout: Option<Arc<crate::syntax::InterfaceLayout>>,
+    pub arrange_interface_overloads: bool,
     pub sort_usings: bool,
     pub arrange_fields: bool,
     pub remove_clearly_unused_usings: bool,
@@ -36,6 +37,7 @@ impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
             interface_layout: None,
+            arrange_interface_overloads: false,
             sort_usings: true,
             // Both operations need a fully resolved semantic model. Elsa's
             // authoritative Windows/VSTO cleanup exposed false positives in
@@ -104,6 +106,7 @@ impl CSharpOptions {
     pub fn newlines_from_properties(properties: &Properties) -> Self {
         let mut options = Self::from_properties(properties);
         options.sort_usings = false;
+        options.arrange_interface_overloads = false;
         options.arrange_fields = false;
         options.remove_clearly_unused_usings = false;
         options.reorder_modifiers = false;
@@ -133,12 +136,16 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     } else {
         input
     };
-    let input = if options.arrange_fields {
-        let input = options
+    let input = if options.arrange_interface_overloads {
+        options
             .interface_layout
             .as_deref()
-            .map(|layout| crate::syntax::arrange_interface_implementations(&input, layout))
-            .unwrap_or(input);
+            .map(|layout| crate::syntax::arrange_interface_overloads(&input, layout))
+            .unwrap_or(input)
+    } else {
+        input
+    };
+    let input = if options.arrange_fields {
         crate::syntax::arrange_misplaced_fields(&input)
     } else {
         input
@@ -2445,6 +2452,7 @@ mod tests {
     fn options() -> CSharpOptions {
         CSharpOptions {
             interface_layout: None,
+            arrange_interface_overloads: false,
             sort_usings: true,
             arrange_fields: true,
             remove_clearly_unused_usings: false,
@@ -2499,6 +2507,7 @@ mod tests {
         )]);
         let options = CSharpOptions::from_properties(&properties);
         assert!(!options.arrange_fields);
+        assert!(!options.arrange_interface_overloads);
         assert!(!options.remove_clearly_unused_usings);
         assert!(!options.reorder_modifiers);
 

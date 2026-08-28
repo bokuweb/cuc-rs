@@ -33,11 +33,14 @@ Modifier ordering and broad token spacing rewrites are implemented as internal
 experiments but are not enabled in `--csharp` yet. They need a syntax-aware
 implementation before they are safe enough to apply to real C#.
 
-Unused `using` removal and member-layout reordering are intentionally not
-enabled because both require a fully resolved semantic model. Earlier local
+Unused `using` removal and general member-layout reordering are intentionally
+not enabled because both require a fully resolved semantic model. Earlier local
 heuristics are retained as testable experiments, but an authoritative
 Windows/VSTO run showed that enabling them could rewrite already-clean Elsa
-sources.
+sources. Solution mode performs one narrower layout fix: when declarations prove
+that a later interface adds a public method overload, that overload is moved in
+front of the primary interface implementation group. Private methods are never
+treated as interface implementations.
 
 ## Usage
 
