@@ -41,6 +41,61 @@ pub fn parse_csharp(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+/// 型宣言の末尾に残った空行を削除する。
+///
+/// ReSharper cleanup は最後のメンバーと型を閉じる波括弧の間に空行を置かない。
+/// 単純な波括弧の深さだけでは initializer や statement block と区別できないため、
+/// tree-sitter が型本体と判定した箇所だけを対象にする。
+pub fn remove_blank_lines_before_type_closing_braces(source: &str) -> String {
+    let Some(tree) = parse_csharp(source) else {
+        return source.to_string();
+    };
+    if tree.root_node().has_error() {
+        return source.to_string();
+    }
+
+    let mut closing_rows = Vec::new();
+    collect_type_closing_rows(tree.root_node(), &mut closing_rows);
+    let mut lines = source.split('\n').collect::<Vec<_>>();
+    closing_rows.sort_unstable();
+    closing_rows.dedup();
+    for closing_row in closing_rows.into_iter().rev() {
+        if closing_row > 0
+            && closing_row < lines.len()
+            && lines[closing_row].trim_start().starts_with('}')
+            && lines[closing_row - 1].trim().is_empty()
+        {
+            lines.remove(closing_row - 1);
+        }
+    }
+    lines.join("\n")
+}
+
+fn collect_type_closing_rows(node: tree_sitter::Node<'_>, rows: &mut Vec<usize>) {
+    if matches!(
+        node.kind(),
+        "class_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "record_declaration"
+            | "enum_declaration"
+    ) {
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut cursor = body.walk();
+            if let Some(closing_brace) =
+                body.children(&mut cursor).find(|child| child.kind() == "}")
+            {
+                rows.push(closing_brace.start_position().row);
+            };
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_type_closing_rows(child, rows);
+    }
+}
+
 fn collect_interface_declarations(
     node: tree_sitter::Node<'_>,
     source: &str,

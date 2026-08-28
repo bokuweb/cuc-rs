@@ -188,6 +188,7 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
         input
     };
     let output = if options.normalize_newlines {
+        let input = crate::syntax::remove_blank_lines_before_type_closing_braces(&input);
         normalize_control_flow_newlines(&input, &options)
     } else {
         input
@@ -744,6 +745,13 @@ fn collapse_adjacent_initializer_items(input: &str, max_line_length: usize) -> S
     let mut index = 0usize;
 
     while index < lines.len() {
+        if let Some((formatted, consumed)) =
+            collapse_collection_initializer(&lines, &normal_lines, index, max_line_length)
+        {
+            output.push(formatted);
+            index += consumed;
+            continue;
+        }
         if let Some((formatted, consumed)) = expand_moq_verify_lambda(&lines, &normal_lines, index)
         {
             output.extend(formatted);
@@ -805,6 +813,57 @@ fn collapse_adjacent_initializer_items(input: &str, max_line_length: usize) -> S
     }
 
     output.join("\n")
+}
+
+fn collapse_collection_initializer(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(String, usize)> {
+    let declaration = *lines.get(index)?;
+    if !normal_lines.get(index).copied().unwrap_or(false)
+        || !declaration.trim_start().starts_with("new ")
+        || declaration.contains(['{', '}'])
+        || lines.get(index + 1)?.trim() != "{"
+    {
+        return None;
+    }
+
+    let item_indent = leading_width(lines.get(index + 2)?);
+    if item_indent <= leading_width(lines[index + 1]) {
+        return None;
+    }
+    let mut end = index + 2;
+    let mut items = Vec::new();
+    while end < lines.len() {
+        let line = lines[end];
+        let trimmed = line.trim();
+        if let Some(suffix) = trimmed.strip_prefix('}') {
+            if items.is_empty() || !matches!(suffix, "" | "," | ";" | ");" | "));" | "),") {
+                return None;
+            }
+            let formatted = format!(
+                "{} {{ {} }}{}",
+                declaration.trim_end(),
+                items.join(" "),
+                suffix
+            );
+            return (formatted.chars().count() <= max_line_length)
+                .then_some((formatted, end - index + 1));
+        }
+        if !normal_lines.get(end).copied().unwrap_or(false)
+            || leading_width(line) != item_indent
+            || trimmed.starts_with(['#', '/', '{'])
+            || trimmed.contains(['{', '}'])
+            || (!trimmed.ends_with(',') && !lines.get(end + 1)?.trim_start().starts_with('}'))
+        {
+            return None;
+        }
+        items.push(trimmed.to_string());
+        end += 1;
+    }
+    None
 }
 
 fn expand_moq_verify_lambda(
@@ -2497,6 +2556,23 @@ mod tests {
             .map(str::to_string)
             .collect(),
         }
+    }
+
+    #[test]
+    fn collapses_short_collection_initializer() {
+        let input = "class C\n{\n    void M()\n    {\n        Assert.AreEqual(\n            new List<Kind>\n            {\n                Kind.First\n            },\n            actual);\n    }\n}\n";
+        let expected = "class C\n{\n    void M()\n    {\n        Assert.AreEqual(\n            new List<Kind> { Kind.First },\n            actual);\n    }\n}\n";
+
+        assert_eq!(format_csharp(input, options()), expected);
+    }
+
+    #[test]
+    fn removes_blank_line_before_type_closing_brace_only() {
+        let input = "class Outer\n{\n    class Inner\n    {\n        void M()\n        {\n\n        }\n\n    }\n\n}\n";
+        let expected =
+            "class Outer\n{\n    class Inner\n    {\n        void M()\n        {\n\n        }\n    }\n}\n";
+
+        assert_eq!(format_csharp(input, options()), expected);
     }
 
     #[test]
