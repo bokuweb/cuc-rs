@@ -7,6 +7,7 @@ mod xaml;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -105,6 +106,21 @@ fn main() -> Result<()> {
     let mut visited = 0usize;
     let mut changed = Vec::new();
     let files = collect_files(&cli.paths)?;
+    // Solution scopeならinterface宣言も同時に参照できるため、後続interfaceが追加した
+    // public overloadをprimary interface実装群の前へ寄せる限定的なlayoutだけを有効化する。
+    // 単一ファイル/ディレクトリ指定では宣言が欠け得るので従来どおり並べ替えない。
+    let interface_layout = if solution_scope && cli.csharp {
+        let sources = files
+            .iter()
+            .filter(|path| is_csharp_file(path))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .collect::<Vec<_>>();
+        Some(Arc::new(crate::syntax::InterfaceLayout::from_sources(
+            sources.iter().map(String::as_str),
+        )))
+    } else {
+        None
+    };
     for path in files {
         let Some(relative_path) = pathdiff(&path, &root) else {
             continue;
@@ -142,7 +158,7 @@ fn main() -> Result<()> {
             }
             None => continue,
         };
-        let options = FormatOptions::from_properties(
+        let mut options = FormatOptions::from_properties(
             &properties,
             cli.text,
             cli.indent,
@@ -151,6 +167,10 @@ fn main() -> Result<()> {
             solution_scope,
             &relative_path,
         );
+        if let (Some(csharp), Some(layout)) = (options.csharp.as_mut(), interface_layout.as_ref()) {
+            csharp.interface_layout = Some(Arc::clone(layout));
+            csharp.arrange_interface_overloads = true;
+        }
         let output = format_text(&input, options);
         visited += 1;
 
@@ -185,6 +205,12 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn is_csharp_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
 }
 
 fn collect_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {

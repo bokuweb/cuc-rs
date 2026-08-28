@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Parser, Tree};
 
@@ -14,7 +14,6 @@ struct InterfaceInfo {
 }
 
 impl InterfaceLayout {
-    #[cfg(test)]
     pub fn from_sources<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
         let mut layout = Self::default();
         for source in sources {
@@ -38,7 +37,6 @@ pub fn parse_csharp(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-#[cfg(test)]
 fn collect_interface_declarations(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -52,7 +50,7 @@ fn collect_interface_declarations(
             let mut cursor = body.walk();
             let members = body
                 .named_children(&mut cursor)
-                .filter_map(|member| member_name(member, source))
+                .filter_map(|member| member_key(member, source))
                 .collect::<Vec<_>>();
             if let Some(name) = node_text(name, source) {
                 let header = source
@@ -100,6 +98,25 @@ fn member_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn member_key(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let name = member_name(node, source)?;
+    match node.kind() {
+        "method_declaration" => {
+            let parameter_count = node
+                .child_by_field_name("parameters")
+                .map(|parameters| {
+                    let mut cursor = parameters.walk();
+                    parameters.named_children(&mut cursor).count()
+                })
+                .unwrap_or(0);
+            Some(format!("method:{name}/{parameter_count}"))
+        }
+        "property_declaration" => Some(format!("property:{name}")),
+        "event_declaration" | "event_field_declaration" => Some(format!("event:{name}")),
+        _ => None,
+    }
+}
+
 fn event_field_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if node.kind() != "event_field_declaration" {
         return None;
@@ -119,6 +136,7 @@ fn event_field_name(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>
     None
 }
 
+#[cfg(test)]
 pub fn arrange_interface_implementations(source: &str, layout: &InterfaceLayout) -> String {
     let Some(tree) = parse_csharp(source) else {
         return source.to_string();
@@ -150,6 +168,229 @@ pub fn arrange_interface_implementations(source: &str, layout: &InterfaceLayout)
         );
     }
     output.join("\n")
+}
+
+/// ReSharperのdefault member layoutが行う並べ替えのうち、semantic modelなしでも
+/// 一意に判定できる「後続interfaceが追加した同名overloadを、primary interface実装群の
+/// 直前へ移す」ケースだけを適用する。一般のinterface member並べ替えは誤検出し得るため扱わない。
+pub fn arrange_interface_overloads(source: &str, layout: &InterfaceLayout) -> String {
+    let Some(tree) = parse_csharp(source) else {
+        return source.to_string();
+    };
+    if tree.root_node().has_error() {
+        return source.to_string();
+    }
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    collect_interface_overload_regions(tree.root_node(), source, &lines, layout, &mut regions);
+    if regions.is_empty() {
+        return source.to_string();
+    }
+    let mut output = lines
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    regions.sort_by_key(|region| region.start_row);
+    for region in regions.into_iter().rev() {
+        let replacement = region
+            .fields
+            .iter()
+            .map(|field| field.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.splice(
+            region.start_row..=region.end_row,
+            replacement.split('\n').map(str::to_string),
+        );
+    }
+    output.join("\n")
+}
+
+fn collect_interface_overload_regions(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    lines: &[&str],
+    layout: &InterfaceLayout,
+    regions: &mut Vec<FieldRegion>,
+) {
+    if node.kind() == "class_declaration" {
+        collect_interface_overload_region_from_class(node, source, lines, layout, regions);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_interface_overload_regions(child, source, lines, layout, regions);
+    }
+}
+
+fn collect_interface_overload_region_from_class(
+    class: tree_sitter::Node<'_>,
+    source: &str,
+    lines: &[&str],
+    layout: &InterfaceLayout,
+    regions: &mut Vec<FieldRegion>,
+) {
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    let header = lines[class.start_position().row..=body.start_position().row].join(" ");
+    let Some((_, bases)) = header.split_once(':') else {
+        return;
+    };
+    let interface_names = bases
+        .trim_end_matches('{')
+        .split(',')
+        .filter_map(|base| {
+            let name = base.trim().rsplit('.').next()?;
+            layout
+                .interfaces
+                .contains_key(name)
+                .then(|| name.to_string())
+        })
+        .collect::<Vec<_>>();
+    if interface_names.len() < 2 {
+        return;
+    }
+
+    let mut primary_members = Vec::new();
+    collect_interface_members(
+        &interface_names[0],
+        layout,
+        &mut primary_members,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let primary_members = primary_members.into_iter().collect::<HashSet<_>>();
+    let mut seen_names = HashMap::<String, HashSet<String>>::new();
+    let mut overloads = HashSet::new();
+    for interface in &interface_names {
+        let mut members = Vec::new();
+        collect_interface_members(
+            interface,
+            layout,
+            &mut members,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        for key in &members {
+            let Some(name) = method_name_from_key(key) else {
+                continue;
+            };
+            if seen_names
+                .get(name)
+                .is_some_and(|prior| !prior.is_empty() && !prior.contains(key))
+            {
+                overloads.insert(key.clone());
+            }
+        }
+        for key in members {
+            if let Some(name) = method_name_from_key(&key) {
+                seen_names.entry(name.to_string()).or_default().insert(key);
+            }
+        }
+    }
+    if overloads.is_empty() {
+        return;
+    }
+
+    let mut cursor = body.walk();
+    let members = body
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "comment" | "attribute_list"))
+        .collect::<Vec<_>>();
+    let Some(anchor) = members.iter().position(|member| {
+        member_key(*member, source).is_some_and(|key| primary_members.contains(&key))
+    }) else {
+        return;
+    };
+    let target_indices = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, member)| {
+            (index > anchor
+                && is_public_member(*member, source)
+                && member_key(*member, source).is_some_and(|key| overloads.contains(&key)))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(last_overload) = target_indices.last().copied() else {
+        return;
+    };
+    let target_indices = target_indices.into_iter().collect::<HashSet<_>>();
+    let misplaced_dispose = members
+        .iter()
+        .enumerate()
+        .find(|(index, member)| {
+            *index > last_overload
+                && is_public_member(**member, source)
+                && member_key(**member, source).is_some_and(|key| key == "method:Dispose/0")
+                && members[last_overload + 1..*index].iter().any(|candidate| {
+                    candidate.kind() == "method_declaration"
+                        && !is_public_member(*candidate, source)
+                })
+        })
+        .map(|(index, _)| index);
+    let region_end = misplaced_dispose.unwrap_or(last_overload);
+    let region_members = &members[anchor..=region_end];
+    let mut blocks = Vec::with_capacity(region_members.len());
+    let mut previous_end = region_members[0].start_position().row;
+    for (offset, member) in region_members.iter().copied().enumerate() {
+        let member_end = member.end_position().row;
+        let block_start = if offset == 0 {
+            member.start_position().row
+        } else {
+            previous_end
+        };
+        let absolute_index = anchor + offset;
+        let category = if target_indices.contains(&absolute_index) {
+            0
+        } else if misplaced_dispose.is_some() && is_public_member(member, source) {
+            1
+        } else if misplaced_dispose.is_some() {
+            2
+        } else {
+            1
+        };
+        blocks.push((category, lines[block_start..=member_end].join("\n")));
+        previous_end = member_end + 1;
+    }
+    blocks.sort_by_key(|(category, _)| *category);
+    let mut fields = blocks
+        .into_iter()
+        .map(|(_, text)| FieldBlock {
+            category: 0,
+            name: String::new(),
+            text,
+        })
+        .collect::<Vec<_>>();
+    for (index, field) in fields.iter_mut().enumerate() {
+        if index == 0 {
+            field.text = field.text.trim_start_matches('\n').to_string();
+        } else if !field.text.starts_with('\n') {
+            field.text.insert(0, '\n');
+        }
+    }
+    regions.push(FieldRegion {
+        start_row: region_members[0].start_position().row,
+        end_row: region_members
+            .last()
+            .map(|member| member.end_position().row)
+            .unwrap_or(0),
+        fields,
+    });
+}
+
+fn method_name_from_key(key: &str) -> Option<&str> {
+    key.strip_prefix("method:")?
+        .split_once('/')
+        .map(|(name, _)| name)
+}
+
+fn is_public_member(member: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut cursor = member.walk();
+    let is_public = member.children(&mut cursor).any(|child| {
+        child.kind() == "modifier" && node_text(child, source).is_some_and(|text| text == "public")
+    });
+    is_public
 }
 
 pub fn arrange_misplaced_fields(source: &str) -> String {
@@ -213,6 +454,7 @@ struct FieldBlock {
     text: String,
 }
 
+#[cfg(test)]
 fn collect_interface_regions(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -229,6 +471,7 @@ fn collect_interface_regions(
     }
 }
 
+#[cfg(test)]
 fn collect_interface_region_from_class(
     class: tree_sitter::Node<'_>,
     source: &str,
@@ -321,7 +564,7 @@ fn collect_interface_region_from_class(
     let tail = &members[last_prefix..];
     let grouped_count = tail
         .iter()
-        .filter_map(|member| member_name(*member, source))
+        .filter_map(|member| member_key(*member, source))
         .filter(|name| member_groups.contains_key(name.as_str()))
         .count();
     if grouped_count == 0 {
@@ -350,7 +593,7 @@ fn collect_interface_region_from_class(
             previous_end
         };
         let group =
-            member_name(member, source).and_then(|name| member_groups.get(name.as_str()).copied());
+            member_key(member, source).and_then(|key| member_groups.get(key.as_str()).copied());
         blocks.push((
             group,
             member_layout_rank(member, source, reorder_event_handlers),
@@ -439,6 +682,7 @@ fn collect_interface_region_from_class(
     });
 }
 
+#[cfg(test)]
 fn member_layout_rank(
     member: tree_sitter::Node<'_>,
     source: &str,
@@ -467,6 +711,7 @@ fn member_layout_rank(
     }
 }
 
+#[cfg(test)]
 fn is_nested_class(class: tree_sitter::Node<'_>) -> bool {
     let mut parent = class.parent();
     while let Some(node) = parent {
@@ -490,15 +735,15 @@ fn collect_interface_members(
     }
     match name {
         "IDisposable" => {
-            disposable_members.push("Dispose".to_string());
+            disposable_members.push("method:Dispose/0".to_string());
             return;
         }
         "IAsyncDisposable" => {
-            disposable_members.push("DisposeAsync".to_string());
+            disposable_members.push("method:DisposeAsync/0".to_string());
             return;
         }
         "IWin32Window" => {
-            members.push("Handle".to_string());
+            members.push("property:Handle".to_string());
             return;
         }
         _ => {}
@@ -1157,6 +1402,36 @@ mod tests {
             super::arrange_interface_implementations(input, &layout),
             expected
         );
+    }
+
+    #[test]
+    fn moves_public_secondary_interface_overload_before_primary_members() {
+        let interfaces = "interface IPlugin\n{\n    bool IsSlow { get; }\n    void Draw(int start);\n}\ninterface IDocumentEndProvider\n{\n    void Draw(int start, int documentEnd);\n}\n";
+        let layout = super::InterfaceLayout::from_sources([interfaces]);
+        let input = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public bool IsSlow => false;\n\n    public void Draw(int start) {}\n\n    public void Draw(int start, int documentEnd) {}\n}\n";
+        let expected = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public void Draw(int start, int documentEnd) {}\n\n    public bool IsSlow => false;\n\n    public void Draw(int start) {}\n}\n";
+        let output = super::arrange_interface_overloads(input, &layout);
+        assert_eq!(output, expected);
+        assert_eq!(super::arrange_interface_overloads(&output, &layout), output);
+    }
+
+    #[test]
+    fn preserves_private_helper_matching_secondary_interface_overload() {
+        let interfaces = "interface IService\n{\n    object Parse(string text, CancellationToken token);\n}\ninterface IOwnerService\n{\n    object Parse(string text, string owner, CancellationToken token);\n}\n";
+        let layout = super::InterfaceLayout::from_sources([interfaces]);
+        let input = "class Service : IService, IOwnerService\n{\n    public object Parse(string text, CancellationToken token) => null;\n\n    private object Parse(string text, string owner, CancellationToken token) => null;\n}\n";
+        assert_eq!(super::arrange_interface_overloads(input, &layout), input);
+    }
+
+    #[test]
+    fn keeps_dispose_with_public_interface_members_when_moving_overload() {
+        let interfaces = "interface IPlugin : IDisposable\n{\n    bool IsSlow { get; }\n    void Draw(int start);\n}\ninterface IDocumentEndProvider\n{\n    void Draw(int start, int documentEnd);\n}\n";
+        let layout = super::InterfaceLayout::from_sources([interfaces]);
+        let input = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public bool IsSlow => false;\n\n    public void Draw(int start) {}\n\n    public void Draw(int start, int documentEnd) {}\n\n    private void DrawCore() {}\n\n    public void Dispose() {}\n}\n";
+        let expected = "class Plugin : IPlugin, IDocumentEndProvider\n{\n    public void Draw(int start, int documentEnd) {}\n\n    public bool IsSlow => false;\n\n    public void Draw(int start) {}\n\n    public void Dispose() {}\n\n    private void DrawCore() {}\n}\n";
+        let output = super::arrange_interface_overloads(input, &layout);
+        assert_eq!(output, expected);
+        assert_eq!(super::arrange_interface_overloads(&output, &layout), output);
     }
 
     #[test]
