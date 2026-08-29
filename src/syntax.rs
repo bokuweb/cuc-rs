@@ -464,6 +464,243 @@ pub fn arrange_misplaced_fields(source: &str) -> String {
     output
 }
 
+/// ReSharper の member layout のうち、semantic model なしでも一意に判断できる
+/// 「field 群の直後に property だけが続き、その後に private field が 1 個だけ現れる」
+/// ケースと、先頭 readonly field 群の単一 name outlier だけを整列する。
+pub fn arrange_unambiguous_fields(source: &str) -> String {
+    let output = arrange_single_late_private_field(source);
+    arrange_single_readonly_prefix_outlier(&output)
+}
+
+fn arrange_single_late_private_field(source: &str) -> String {
+    let Some(tree) = parse_csharp(source) else {
+        return source.to_string();
+    };
+    if tree.root_node().has_error() {
+        return source.to_string();
+    }
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    collect_single_late_field_regions(tree.root_node(), source, &lines, &mut regions);
+    if regions.is_empty() {
+        return source.to_string();
+    }
+    apply_field_regions(&lines, regions)
+}
+
+fn collect_single_late_field_regions(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    lines: &[&str],
+    regions: &mut Vec<FieldRegion>,
+) {
+    if node.kind() == "declaration_list" {
+        let mut cursor = node.walk();
+        let members = node
+            .named_children(&mut cursor)
+            .filter(|member| {
+                !matches!(
+                    member.kind(),
+                    "comment" | "attribute_list" | "preproc_region" | "preproc_endregion"
+                )
+            })
+            .collect::<Vec<_>>();
+        let prefix_len = members
+            .iter()
+            .take_while(|member| {
+                matches!(
+                    member.kind(),
+                    "field_declaration" | "constructor_declaration"
+                )
+            })
+            .count();
+        let late_fields = members
+            .iter()
+            .enumerate()
+            .skip(prefix_len)
+            .filter(|(_, member)| member.kind() == "field_declaration")
+            .collect::<Vec<_>>();
+        if prefix_len > 0 && late_fields.len() == 1 {
+            let (late_index, late_field) = late_fields[0];
+            let between_is_properties = members[prefix_len..late_index]
+                .iter()
+                .all(|member| member.kind() == "property_declaration");
+            let declaration = node_text(*late_field, source).unwrap_or_default();
+            if between_is_properties && declaration.trim_start().starts_with("private ") {
+                let region_members = &members[..=late_index];
+                let region_start = region_members[0].start_position().row;
+                let region_end = late_field.end_position().row;
+                let mut blocks = member_blocks(region_members, lines, region_start);
+                let late_block = blocks.remove(late_index);
+                let late_key = (late_block.category, late_block.name.as_str());
+                let insertion = blocks[..prefix_len]
+                    .iter()
+                    .position(|block| (block.category, block.name.as_str()) > late_key)
+                    .unwrap_or(prefix_len);
+                blocks.insert(insertion, late_block);
+                normalize_field_block_spacing(&mut blocks);
+                regions.push(FieldRegion {
+                    start_row: region_start,
+                    end_row: region_end,
+                    fields: blocks,
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_single_late_field_regions(child, source, lines, regions);
+    }
+}
+
+fn arrange_single_readonly_prefix_outlier(source: &str) -> String {
+    let Some(tree) = parse_csharp(source) else {
+        return source.to_string();
+    };
+    if tree.root_node().has_error() {
+        return source.to_string();
+    }
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    collect_readonly_prefix_outlier_regions(tree.root_node(), &lines, &mut regions);
+    if regions.is_empty() {
+        return source.to_string();
+    }
+    apply_field_regions(&lines, regions)
+}
+
+fn collect_readonly_prefix_outlier_regions(
+    node: tree_sitter::Node<'_>,
+    lines: &[&str],
+    regions: &mut Vec<FieldRegion>,
+) {
+    if node.kind() == "declaration_list" {
+        let mut cursor = node.walk();
+        let fields = node
+            .named_children(&mut cursor)
+            .filter(|member| member.kind() != "comment")
+            .take_while(|member| member.kind() == "field_declaration")
+            .collect::<Vec<_>>();
+        if fields.len() >= 3 {
+            let region_start = fields[0].start_position().row;
+            let mut blocks = member_blocks(&fields, lines, region_start);
+            let readonly_indices = blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.category == 2)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if readonly_indices.len() >= 3 {
+                let names = readonly_indices
+                    .iter()
+                    .map(|index| blocks[*index].name.as_str())
+                    .collect::<Vec<_>>();
+                let candidates = (0..names.len())
+                    .filter(|removed| {
+                        names
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| index != removed)
+                            .map(|(_, name)| *name)
+                            .collect::<Vec<_>>()
+                            .windows(2)
+                            .all(|pair| pair[0] <= pair[1])
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.len() == 1 {
+                    let moved_index = readonly_indices[candidates[0]];
+                    let moved = blocks.remove(moved_index);
+                    let insertion = blocks
+                        .iter()
+                        .position(|block| block.category == 2 && block.name > moved.name)
+                        .or_else(|| {
+                            blocks
+                                .iter()
+                                .rposition(|block| block.category == 2)
+                                .map(|index| index + 1)
+                        })
+                        .unwrap_or(blocks.len());
+                    blocks.insert(insertion, moved);
+                    normalize_field_block_spacing(&mut blocks);
+                    regions.push(FieldRegion {
+                        start_row: region_start,
+                        end_row: fields
+                            .last()
+                            .map(|field| field.end_position().row)
+                            .unwrap_or(region_start),
+                        fields: blocks,
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_readonly_prefix_outlier_regions(child, lines, regions);
+    }
+}
+
+fn member_blocks(
+    members: &[tree_sitter::Node<'_>],
+    lines: &[&str],
+    region_start: usize,
+) -> Vec<FieldBlock> {
+    let mut blocks = Vec::with_capacity(members.len());
+    let mut block_start = region_start;
+    for (index, member) in members.iter().copied().enumerate() {
+        let end = member.end_position().row;
+        let (category, name) = if member.kind() == "field_declaration" {
+            field_sort_key(&lines[member.start_position().row..=end].join("\n"))
+                .unwrap_or((250, format!("{index:08}")))
+        } else if member.kind() == "constructor_declaration" {
+            (251, format!("{index:08}"))
+        } else {
+            (252, format!("{index:08}"))
+        };
+        blocks.push(FieldBlock {
+            category,
+            name,
+            text: lines[block_start..=end].join("\n"),
+        });
+        block_start = end + 1;
+    }
+    blocks
+}
+
+fn normalize_field_block_spacing(blocks: &mut [FieldBlock]) {
+    for (index, block) in blocks.iter_mut().enumerate() {
+        if index == 0 {
+            block.text = block.text.trim_start_matches('\n').to_string();
+        } else if !block.text.starts_with('\n') {
+            block.text.insert(0, '\n');
+        }
+    }
+}
+
+fn apply_field_regions(lines: &[&str], mut regions: Vec<FieldRegion>) -> String {
+    if regions.is_empty() {
+        return lines.join("\n");
+    }
+    let mut output = lines
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    regions.sort_by_key(|region| region.start_row);
+    for region in regions.into_iter().rev() {
+        let replacement = region
+            .fields
+            .iter()
+            .map(|field| field.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.splice(
+            region.start_row..=region.end_row,
+            replacement.split('\n').map(str::to_string),
+        );
+    }
+    output.join("\n")
+}
+
 fn arrange_misplaced_fields_once(source: &str) -> String {
     let Some(tree) = parse_csharp(source) else {
         return source.to_string();
@@ -1395,6 +1632,14 @@ mod tests {
             super::arrange_misplaced_fields(input),
             "class C\n{\n    private readonly object _detailCache;\n\n    private readonly object _paragraphs;\n}\n"
         );
+    }
+
+    #[test]
+    fn moves_late_private_field_to_prefix_and_sorts_readonly_outlier() {
+        let input = "class C\n{\n    private readonly int _max;\n\n    private readonly object _paragraphLru;\n\n    private readonly object _paragraphs;\n\n    public int Count => 0;\n\n    // Identity index.\n    private readonly object _paragraphKeysByIdentity;\n\n    public void Clear() {}\n}\n";
+        let expected = "class C\n{\n    private readonly int _max;\n\n    // Identity index.\n    private readonly object _paragraphKeysByIdentity;\n\n    private readonly object _paragraphLru;\n\n    private readonly object _paragraphs;\n\n    public int Count => 0;\n\n    public void Clear() {}\n}\n";
+
+        assert_eq!(super::arrange_unambiguous_fields(input), expected);
     }
 
     #[test]

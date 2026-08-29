@@ -47,10 +47,10 @@ impl CSharpOptions {
             reorder_modifiers: false,
             normalize_spacing: true,
             normalize_newlines: true,
-            collapse_simple_wrapping: properties
-                .get("resharper_keep_existing_invocation_parens_arrangement")
-                .map(|value| value == "false")
-                .unwrap_or(false),
+            // ReSharper's individual keep-existing switches do not authorize
+            // collapsing unrelated blocks and initializers. Production mode
+            // applies only the narrow, syntax-proven repairs below.
+            collapse_simple_wrapping: false,
             prefer_expression_bodied_members: style_enabled(
                 properties,
                 "csharp_style_expression_bodied_constructors",
@@ -150,6 +150,7 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     } else {
         input
     };
+    let input = crate::syntax::arrange_unambiguous_fields(&input);
     let input = if options.reorder_modifiers {
         reorder_modifiers(&input, &options)
     } else {
@@ -178,6 +179,8 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     } else {
         input
     };
+    let input = expand_long_invocation_assignment_arguments(&input, options.max_line_length);
+    let input = repair_resharper_expression_body_layout(&input, options.max_line_length);
     let input = if options.collapse_simple_wrapping {
         let input = expand_long_object_creation_arguments(&input, options.max_line_length);
         let input = collapse_empty_using_blocks(&input, options.max_line_length);
@@ -265,6 +268,69 @@ fn expand_long_object_creation_arguments(input: &str, max_line_length: usize) ->
                 }
             }
             output
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if input.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn expand_long_invocation_assignment_arguments(input: &str, max_line_length: usize) -> String {
+    let normal_lines = normal_code_lines(input);
+    let mut output = input
+        .lines()
+        .zip(normal_lines)
+        .map(|(line, normal)| {
+            if !normal
+                || line.chars().count() <= max_line_length
+                || !line.trim_end().ends_with(");")
+            {
+                return line.to_string();
+            }
+            let Some(assignment) = line.find(" = ") else {
+                return line.to_string();
+            };
+            let Some(relative_open) = line[assignment + 3..].find('(') else {
+                return line.to_string();
+            };
+            let open = assignment + 3 + relative_open;
+            let Some(close) = line.rfind(");") else {
+                return line.to_string();
+            };
+            if close <= open || line[open + 1..close].contains("=>") {
+                return line.to_string();
+            }
+            let Some(commas) = top_level_comma_offsets(&line[open + 1..close]) else {
+                return line.to_string();
+            };
+            if commas.is_empty() {
+                return line.to_string();
+            }
+            let mut arguments = Vec::with_capacity(commas.len() + 1);
+            let mut start = open + 1;
+            for comma in commas {
+                let end = open + 1 + comma;
+                arguments.push(line[start..end].trim());
+                start = end + 1;
+            }
+            arguments.push(line[start..close].trim());
+            if arguments.iter().any(|argument| argument.is_empty()) {
+                return line.to_string();
+            }
+            let indent = &line[..leading_width(line)];
+            let continuation = format!("{indent}    ");
+            let mut formatted = format!("{}\n", &line[..=open]);
+            for (index, argument) in arguments.iter().enumerate() {
+                formatted.push_str(&continuation);
+                formatted.push_str(argument);
+                if index + 1 < arguments.len() {
+                    formatted.push_str(",\n");
+                }
+            }
+            formatted.push_str(&line[close..]);
+            formatted
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -746,6 +812,20 @@ fn collapse_adjacent_initializer_items(input: &str, max_line_length: usize) -> S
 
     while index < lines.len() {
         if let Some((formatted, consumed)) =
+            realign_existing_expression_bodied_boolean_chain(&lines, &normal_lines, index)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
+            collapse_expression_bodied_assignment(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        if let Some((formatted, consumed)) =
             collapse_collection_initializer(&lines, &normal_lines, index, max_line_length)
         {
             output.push(formatted);
@@ -813,6 +893,122 @@ fn collapse_adjacent_initializer_items(input: &str, max_line_length: usize) -> S
     }
 
     output.join("\n")
+}
+
+fn realign_existing_expression_bodied_boolean_chain(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first = *lines.get(index)?;
+    if normal_lines.get(index) != Some(&true) || !first.trim_end().ends_with("&&") {
+        return None;
+    }
+    let arrow = first.find("=> ")?;
+    if !looks_like_member_declaration(first[..arrow].trim_end()) {
+        return None;
+    }
+    let expression_column = arrow + 3;
+    let mut end = index + 1;
+    while let Some(line) = lines.get(end) {
+        if normal_lines.get(end) != Some(&true) {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.ends_with(';') {
+            break;
+        }
+        if !trimmed.ends_with("&&") {
+            return None;
+        }
+        end += 1;
+    }
+    if end == index + 1 || end >= lines.len() {
+        return None;
+    }
+    let alignment = " ".repeat(expression_column);
+    let mut formatted = Vec::with_capacity(end - index + 1);
+    formatted.push(first.to_string());
+    for line in &lines[index + 1..=end] {
+        formatted.push(format!("{alignment}{}", line.trim()));
+    }
+    Some((formatted, end - index + 1))
+}
+
+fn repair_resharper_expression_body_layout(input: &str, max_line_length: usize) -> String {
+    let lines = input.split('\n').collect::<Vec<_>>();
+    let normal_lines = normal_code_lines(input);
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if nearly_aligned_expression_body(&lines, index) {
+            if let Some((formatted, consumed)) =
+                realign_existing_expression_bodied_boolean_chain(&lines, &normal_lines, index)
+            {
+                output.extend(formatted);
+                index += consumed;
+                continue;
+            }
+        }
+        if let Some((formatted, consumed)) =
+            collapse_expression_bodied_assignment(&lines, &normal_lines, index, max_line_length)
+        {
+            output.extend(formatted);
+            index += consumed;
+            continue;
+        }
+        output.push(lines[index].to_string());
+        index += 1;
+    }
+
+    output.join("\n")
+}
+
+fn nearly_aligned_expression_body(lines: &[&str], index: usize) -> bool {
+    let Some(first) = lines.get(index) else {
+        return false;
+    };
+    let Some(arrow) = first.find("=> ") else {
+        return false;
+    };
+    let Some(continuation) = lines.get(index + 1) else {
+        return false;
+    };
+    leading_width(continuation).abs_diff(arrow + 3) <= 1
+}
+
+fn collapse_expression_bodied_assignment(
+    lines: &[&str],
+    normal_lines: &[bool],
+    index: usize,
+    max_line_length: usize,
+) -> Option<(Vec<String>, usize)> {
+    let first = *lines.get(index)?;
+    let assignment = *lines.get(index + 1)?;
+    let value = *lines.get(index + 2)?;
+    if normal_lines
+        .get(index..=index + 2)?
+        .iter()
+        .any(|normal| !normal)
+        || !first.trim_end().ends_with("=>")
+        || !looks_like_member_declaration(first.trim_end().trim_end_matches("=>").trim_end())
+        || !assignment.trim_end().ends_with('=')
+        || !value.trim_end().ends_with(';')
+        || assignment.contains("//")
+        || value.contains("//")
+    {
+        return None;
+    }
+    let introduction = format!("{} {}", first.trim_end(), assignment.trim());
+    if introduction.chars().count() > max_line_length {
+        return None;
+    }
+    let value_indent = " ".repeat(leading_width(first) + 4);
+    Some((
+        vec![introduction, format!("{value_indent}{}", value.trim())],
+        3,
+    ))
 }
 
 fn collapse_collection_initializer(
@@ -2860,6 +3056,38 @@ mod tests {
         assert_eq!(
             format_csharp(input, options()),
             "class C\n{\n    public bool Equals(C other) => Start == other.Start &&\n                                   End == other.End &&\n                                   Limit == other.Limit;\n}\n"
+        );
+    }
+
+    #[test]
+    fn aligns_expression_bodied_boolean_chain_from_existing_first_expression() {
+        let input = "class C\n{\n    public bool Equals(C other) => First == other.First &&\n                                    Second == other.Second &&\n                                    Third == other.Third;\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    public bool Equals(C other) => First == other.First &&\n                                   Second == other.Second &&\n                                   Third == other.Third;\n}\n"
+        );
+    }
+
+    #[test]
+    fn expands_long_invocation_assignment_arguments() {
+        let input = "class C\n{\n    void M()\n    {\n        bool hit = cache.TryGetRangeGeometry(after, range, true, out _, out OverlayRenderCache.RangeGeometry actual);\n    }\n}\n";
+        let mut options = options();
+        options.max_line_length = 100;
+
+        assert_eq!(
+            format_csharp(input, options),
+            "class C\n{\n    void M()\n    {\n        bool hit = cache.TryGetRangeGeometry(\n            after,\n            range,\n            true,\n            out _,\n            out OverlayRenderCache.RangeGeometry actual);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn collapses_short_expression_bodied_assignment() {
+        let input = "class C\n{\n    private void Register(int end) =>\n        _pending =\n            Merge(_pending, end);\n}\n";
+
+        assert_eq!(
+            format_csharp(input, options()),
+            "class C\n{\n    private void Register(int end) => _pending =\n        Merge(_pending, end);\n}\n"
         );
     }
 
