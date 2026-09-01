@@ -469,7 +469,8 @@ pub fn arrange_misplaced_fields(source: &str) -> String {
 /// ケースと、先頭 readonly field 群の単一 name outlier だけを整列する。
 pub fn arrange_unambiguous_fields(source: &str) -> String {
     let output = arrange_single_late_private_field(source);
-    arrange_single_readonly_prefix_outlier(&output)
+    let output = arrange_single_readonly_prefix_outlier(&output);
+    arrange_single_mutable_field_outlier(&output)
 }
 
 fn arrange_single_late_private_field(source: &str) -> String {
@@ -637,6 +638,76 @@ fn collect_readonly_prefix_outlier_regions(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_readonly_prefix_outlier_regions(child, lines, regions);
+    }
+}
+
+fn arrange_single_mutable_field_outlier(source: &str) -> String {
+    let Some(tree) = parse_csharp(source) else {
+        return source.to_string();
+    };
+    if tree.root_node().has_error() {
+        return source.to_string();
+    }
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    collect_mutable_field_outlier_regions(tree.root_node(), &lines, &mut regions);
+    if regions.is_empty() {
+        return source.to_string();
+    }
+    apply_field_regions(&lines, regions)
+}
+
+/// ReSharper の field name 順に対し、1 field だけが外れていることを一意に証明できる
+/// field/comment 専用領域を整列する。method や property が挟まる領域は扱わない。
+fn collect_mutable_field_outlier_regions(
+    node: tree_sitter::Node<'_>,
+    lines: &[&str],
+    regions: &mut Vec<FieldRegion>,
+) {
+    if node.kind() == "declaration_list"
+        && node
+            .parent()
+            .is_some_and(|owner| owner.kind() == "class_declaration")
+    {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let field_nodes = children
+            .iter()
+            .copied()
+            .filter(|child| child.kind() == "field_declaration")
+            .collect::<Vec<_>>();
+        if field_nodes.len() >= 3 {
+            let first_field_index = children
+                .iter()
+                .position(|child| child.kind() == "field_declaration")
+                .unwrap_or(0);
+            let last_field_index = children
+                .iter()
+                .rposition(|child| child.kind() == "field_declaration")
+                .unwrap_or(first_field_index);
+            let fields_are_contiguous = children[first_field_index..=last_field_index]
+                .iter()
+                .all(|child| matches!(child.kind(), "field_declaration" | "comment"));
+            if fields_are_contiguous {
+                let region_start = field_nodes[0].start_position().row;
+                let mut blocks = member_blocks(&field_nodes, lines, region_start);
+                if move_single_name_outlier(&mut blocks, 3, false) {
+                    normalize_field_block_spacing(&mut blocks);
+                    regions.push(FieldRegion {
+                        start_row: region_start,
+                        end_row: field_nodes
+                            .last()
+                            .map(|field| field.end_position().row)
+                            .unwrap_or(region_start),
+                        fields: blocks,
+                    });
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_mutable_field_outlier_regions(child, lines, regions);
     }
 }
 
@@ -1647,6 +1718,28 @@ mod tests {
         let input = "class C\n{\n    private int _alpha;\n\n    private (int X, int Y) _delta;\n\n    private int _epsilon;\n\n    // beta details\n    private int _beta;\n\n    private int _gamma;\n}\n";
         let expected = "class C\n{\n    private int _alpha;\n\n    // beta details\n    private int _beta;\n\n    private (int X, int Y) _delta;\n\n    private int _epsilon;\n\n    private int _gamma;\n}\n";
         assert_eq!(super::arrange_misplaced_fields(input), expected);
+    }
+
+    #[test]
+    fn moves_single_mutable_field_name_outlier_in_production_layout() {
+        let input = "class C\n{\n    private int _activeInput;\n\n    private int _activeOverlay;\n\n    private object _applied;\n\n    private int _disposed;\n\n    // Scroll diagnostics.\n    private int _activeScroll;\n\n    private int _scrollPending;\n}\n";
+        let expected = "class C\n{\n    private int _activeInput;\n\n    private int _activeOverlay;\n\n    // Scroll diagnostics.\n    private int _activeScroll;\n\n    private object _applied;\n\n    private int _disposed;\n\n    private int _scrollPending;\n}\n";
+
+        assert_eq!(super::arrange_unambiguous_fields(input), expected);
+    }
+
+    #[test]
+    fn preserves_ambiguous_mutable_field_order_in_production_layout() {
+        let input = "class C\n{\n    private int _delta;\n\n    private int _alpha;\n\n    private int _charlie;\n\n    private int _bravo;\n}\n";
+
+        assert_eq!(super::arrange_unambiguous_fields(input), input);
+    }
+
+    #[test]
+    fn preserves_struct_field_order_in_production_layout() {
+        let input = "struct NativeLayout\n{\n    public int Size;\n\n    public int Flags;\n\n    public int Monitor;\n\n    public int Work;\n}\n";
+
+        assert_eq!(super::arrange_unambiguous_fields(input), input);
     }
 
     #[test]
