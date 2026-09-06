@@ -1,4 +1,5 @@
 mod csharp;
+mod csharp_layout;
 mod editorconfig;
 mod formatter;
 mod oracle;
@@ -497,3 +498,6 @@ mod tests {
         assert!(!is_cleanup_text_file(Path::new("icon.png")));
     }
 }
+
+#[cfg(test)]
+mod cleanup_parity_tests;

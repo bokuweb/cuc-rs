@@ -26,6 +26,9 @@ Newline-only C# checks are available behind `--csharp-newlines`.
   ReSharper is configured not to preserve the existing arrangement
 - replacement of `var` for simple object creation when the configured style
   prefers an apparent explicit type
+- syntax-aware wrapping of long method/constructor parameter lists with
+  `chop_if_long`, packing of identifier-only object initializer assignments,
+  and wrapping of long local string assignments without changing literal bytes
 - conservative XAML tag/attribute spacing and continuation alignment, including
   SDK-style WPF projects' implicit `Page` and `ApplicationDefinition` items
 
@@ -43,6 +46,19 @@ front of the primary implementation group, and a class field block may contain
 one name-order outlier while every remaining mutable field is already sorted.
 Private methods are never treated as interface implementations, and struct field
 order is never changed.
+
+The declaration/initializer layout regressions in
+`src/cleanup_parity_tests.rs` use synthetic inputs derived from Windows
+ReSharper cleanup differences. Parameter chopping requires
+`resharper_csharp_wrap_parameters_style=chop_if_long`,
+`resharper_keep_existing_declaration_parens_arrangement=false`, and
+`resharper_wrap_after_declaration_lpar=true`. Initializer packing requires
+`resharper_keep_existing_initializer_arrangement=false`. Long local string
+assignments use the configured margin (120 columns when omitted). These passes
+skip comments, ambiguous/nested initializer values, and multiline literals;
+they are disabled in `--csharp-newlines` mode. General namespace import
+insertion and shortening qualified names still require reference-aware cleanup
+and are not implemented by these passes.
 
 ## Usage
 
