@@ -6,6 +6,7 @@ use crate::editorconfig::Properties;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct CSharpOptions {
+    pub safe_layout: crate::csharp_layout::LayoutOptions,
     pub interface_layout: Option<Arc<crate::syntax::InterfaceLayout>>,
     pub arrange_interface_overloads: bool,
     pub sort_usings: bool,
@@ -36,6 +37,7 @@ pub struct CSharpOptions {
 impl CSharpOptions {
     pub fn from_properties(properties: &Properties) -> Self {
         Self {
+            safe_layout: crate::csharp_layout::LayoutOptions::from_properties(properties),
             interface_layout: None,
             arrange_interface_overloads: false,
             sort_usings: true,
@@ -105,6 +107,7 @@ impl CSharpOptions {
 
     pub fn newlines_from_properties(properties: &Properties) -> Self {
         let mut options = Self::from_properties(properties);
+        options.safe_layout = crate::csharp_layout::LayoutOptions::default();
         options.sort_usings = false;
         options.arrange_interface_overloads = false;
         options.arrange_fields = false;
@@ -190,6 +193,8 @@ pub fn format_csharp(input: &str, options: CSharpOptions) -> String {
     } else {
         input
     };
+    let input =
+        crate::csharp_layout::format_layout(&input, &options.safe_layout, options.max_line_length);
     let output = if options.normalize_newlines {
         let input = crate::syntax::remove_blank_lines_before_type_closing_braces(&input);
         normalize_control_flow_newlines(&input, &options)
@@ -2706,6 +2711,7 @@ mod tests {
 
     fn options() -> CSharpOptions {
         CSharpOptions {
+            safe_layout: crate::csharp_layout::LayoutOptions::default(),
             interface_layout: None,
             arrange_interface_overloads: false,
             sort_usings: true,
